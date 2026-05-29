@@ -1716,7 +1716,18 @@ static void add_category_ui(Database *db) {
     }
 
     n = read_int_range("Custom fields:", 1, MAX_FIELDS);
-    if (n == INPUT_CANCEL) n = 0;
+    if (n == INPUT_CANCEL) {
+        /* ESC at this point cancels the whole action. The category was created
+           in memory a moment ago, so we undo it and save nothing. It is always
+           the last category in the array, which makes removal simple and safe. */
+        memset(&db->categories[ci], 0, sizeof(db->categories[ci]));
+        if (db->category_count > 0) db->category_count--;
+        db->dirty = 0;
+        print_indent(get_layout().left);
+        printf("%s" "Canceled. The category was not created.\n" "%s", COLOR_DIM, COLOR_RESET);
+        pause_enter();
+        return;
+    }
 
     for (i = 0; i < n; i++) {
         char field[MAX_NAME];
@@ -1724,7 +1735,11 @@ static void add_category_ui(Database *db) {
         int r;
 
         snprintf(prompt, sizeof(prompt), "Field %d name:", i + 1);
-        if (!read_required_line(prompt, field, sizeof(field))) break;
+        if (!read_required_line(prompt, field, sizeof(field))) {
+            /* ESC while typing field names: keep the fields already added. If
+               none were added yet, cancel the whole category like above. */
+            break;
+        }
 
         r = add_field_internal(db, ci, field);
         if (r == -2) {
@@ -1732,6 +1747,17 @@ static void add_category_ui(Database *db) {
             printf("%s" "Duplicated field ignored. Try another name.\n" "%s", COLOR_YELLOW, COLOR_RESET);
             i--;
         }
+    }
+
+    if (db->categories[ci].field_count == 0) {
+        /* A category with no fields cannot store anything, so do not keep it. */
+        memset(&db->categories[ci], 0, sizeof(db->categories[ci]));
+        if (db->category_count > 0) db->category_count--;
+        db->dirty = 0;
+        print_indent(get_layout().left);
+        printf("%s" "Canceled. A category needs at least one field.\n" "%s", COLOR_DIM, COLOR_RESET);
+        pause_enter();
+        return;
     }
 
     if (save_database(db)) {
