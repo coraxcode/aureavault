@@ -1,25 +1,24 @@
 /*
- * AureaVault - A universal life catalog in one pure C file.
+ * AureaVault - A universal life catalog in a single C file (SQLite-backed).
  *
- * Build:
- *   gcc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -D_FORTIFY_SOURCE=2 Aureavault.c -o Aureavault
+ * Build (with the bundled SQLite amalgamation, no system libraries needed):
+ *   gcc -std=c99 -O2 -D_FORTIFY_SOURCE=2 aureavault.c sqlite3.c -o aureavault -lpthread
  *
  * Run:
  *   ./aureavault
  *
  * Database:
- *   aureavault.csv
+ *   aureavault.db   (SQLite database file; scales to millions of items)
  *
  * Goals:
- *   - One single C file.
- *   - No ncurses and no external dependencies.
- *   - Linux/POSIX terminal UI using ANSI escape codes only.
- *   - One normalized CSV database file.
+ *   - Single C program; data engine is SQLite (one extra .c file, public domain).
+ *   - No ncurses; Linux/POSIX terminal UI using ANSI escape codes only.
  *   - Fully custom categories and fields.
- *   - Add, list, view, search, edit, delete and statistics.
- *   - Dialog-like aligned interface with a cyberpunk/golden-ratio feel.
+ *   - Add, list, view, search, edit, delete, statistics, ISO 8601 timestamps.
+ *   - ESC cancels/goes back anywhere. Colors are optional.
+ *   - Durable: every change is an ACID transaction (safe on power loss).
  *
- * Version: 3.0 UI-aligned build.
+ * Version: 4.0 SQLite build.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -35,21 +34,19 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 
+#include "sqlite3.h"
+
 #define APP_NAME        "AureaVault"
 #define APP_TAGLINE     "A golden-ratio life catalog for everything you keep."
-#define DB_FILE         "aureavault.csv"
-#define DB_TEMP_FILE    "aureavault.csv.tmp"
+#define DB_FILE         "aureavault.db"
 
 #define PHI             1.61803398875
 #define INV_PHI         0.61803398875
 
-#define MAX_CATEGORIES  64
-#define MAX_FIELDS      32
-#define MAX_ITEMS       4096
-#define MAX_NAME        64
-#define MAX_VALUE       1024
-#define MAX_CELLS       8
-#define CSV_LINE        8192
+/* These are UI/limits only; the database itself is not bounded by them. */
+#define MAX_FIELDS      64        /* fields shown/handled per category in the UI */
+#define MAX_NAME        128
+#define MAX_VALUE       4096      /* max length of a single field value in the UI */
 #define SCREEN_MIN_WIDTH 76
 #define SCREEN_MAX_WIDTH 116
 #define PAGE_LINES      12
@@ -79,33 +76,6 @@
 #define MENU_NUMBER_W   4
 
 typedef struct {
-    char name[MAX_NAME];
-} Field;
-
-typedef struct {
-    char name[MAX_NAME];
-    int field_count;
-    Field fields[MAX_FIELDS];
-} Category;
-
-typedef struct {
-    int used;
-    int id;
-    char category[MAX_NAME];
-    char created[32];                 /* ISO 8601 timestamp, e.g. 2026-05-29T20:17:08 */
-    char values[MAX_FIELDS][MAX_VALUE];
-} Item;
-
-typedef struct {
-    Category categories[MAX_CATEGORIES];
-    int category_count;
-    Item items[MAX_ITEMS];
-    int item_count;
-    int next_id;
-    int dirty;
-} Database;
-
-typedef struct {
     int cols;
     int rows;
     int width;
@@ -115,19 +85,55 @@ typedef struct {
     int value_width;
 } Layout;
 
-static Database g_db;
+/* The whole database is a single SQLite connection. */
+static sqlite3 *g_db = NULL;
 static int g_color = 1;   /* 1 = colors on, 0 = plain text (no escapes) */
-static int g_load_truncated = 0; /* set if the file held more data than fits in memory */
+
 static int g_input_canceled = 0; /* set when the user presses ESC to cancel/go back */
 
 static void clear_screen(void);
 static int terminal_is_ansi(void);
 static void pause_enter(void);
-static int load_database(Database *db);
-static int save_database(Database *db);
-static void main_menu(Database *db);
+static void main_menu(void);
 static int read_line_raw(char *buffer, size_t buffer_size);
-static void export_text_report(Database *db);
+static void export_text_report(void);
+
+/* ---- UTF-8 display-width helpers --------------------------------------------
+   The terminal shows characters, not bytes. A byte with the top bits "10" is a
+   UTF-8 continuation byte and takes no column of its own. These helpers let the
+   UI measure and cut text by visible width so borders always line up, even with
+   accented text (a, e, i, o, u with marks, c-cedilla, etc.). This is a width
+   approximation that is exact for the Latin text this program handles. */
+
+static int utf8_is_continuation(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+/* Number of visible characters (code points) in a UTF-8 string. */
+static size_t utf8_width(const char *s) {
+    size_t w = 0;
+    if (s == NULL) return 0;
+    while (*s) {
+        if (!utf8_is_continuation((unsigned char)*s)) w++;
+        s++;
+    }
+    return w;
+}
+
+/* Byte length of the first n visible characters of s (stops at the NUL). */
+static size_t utf8_byte_len_for_width(const char *s, size_t n) {
+    size_t bytes = 0;
+    size_t seen = 0;
+    if (s == NULL) return 0;
+    while (s[bytes] != '\0' && seen < n) {
+        bytes++;
+        while (s[bytes] != '\0' && utf8_is_continuation((unsigned char)s[bytes])) {
+            bytes++;
+        }
+        seen++;
+    }
+    return bytes;
+}
 
 static int safe_copy(char *dst, size_t dst_size, const char *src) {
     size_t n;
@@ -206,29 +212,6 @@ static int strings_equal_ci(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
-static int contains_ci(const char *haystack, const char *needle) {
-    size_t nlen;
-    const char *h;
-
-    if (haystack == NULL || needle == NULL) return 0;
-    if (*needle == '\0') return 1;
-
-    nlen = strlen(needle);
-
-    for (h = haystack; *h; h++) {
-        size_t i;
-        for (i = 0; i < nlen; i++) {
-            if (h[i] == '\0') return 0;
-            if (tolower((unsigned char)h[i]) !=
-                tolower((unsigned char)needle[i])) {
-                break;
-            }
-        }
-        if (i == nlen) return 1;
-    }
-
-    return 0;
-}
 
 static int parse_int_strict(const char *s, int min_value, int max_value, int *out) {
     char *endptr;
@@ -303,18 +286,43 @@ static void print_indent(int spaces) {
     for (i = 0; i < spaces; i++) putchar(' ');
 }
 
+/* Copies src into dst so that it occupies at most "width" visible columns.
+   If src is wider, it is cut and an ellipsis "..." is added. Counting is by
+   UTF-8 characters, never bytes, and a multi-byte character is never split,
+   so the output always has a predictable display width and dst is never
+   overflowed. */
 static void crop_text(const char *src, char *dst, size_t dst_size, int width) {
-    size_t src_len;
-    size_t copy_len;
+    size_t src_width;
+    size_t keep_chars;
+    size_t copy_bytes;
 
     if (dst == NULL || dst_size == 0) return;
     if (src == NULL) src = "";
     if (width < 0) width = 0;
 
-    src_len = strlen(src);
+    src_width = utf8_width(src);
 
-    if ((int)src_len <= width) {
+    /* Fits by display width AND fits in the byte buffer: copy verbatim. */
+    if ((int)src_width <= width && strlen(src) < dst_size) {
         safe_copy(dst, dst_size, src);
+        return;
+    }
+    /* Fits by display width but the byte buffer is too small (many multi-byte
+       characters): copy as many WHOLE characters as fit, never splitting one. */
+    if ((int)src_width <= width) {
+        size_t limit = dst_size - 1;
+        size_t pos = 0;
+        for (;;) {
+            size_t clen = 1;
+            while (src[pos + clen] != '\0' &&
+                   utf8_is_continuation((unsigned char)src[pos + clen])) {
+                clen++;
+            }
+            if (src[pos] == '\0' || pos + clen > limit) break;
+            pos += clen;
+        }
+        memcpy(dst, src, pos);
+        dst[pos] = '\0';
         return;
     }
 
@@ -323,31 +331,54 @@ static void crop_text(const char *src, char *dst, size_t dst_size, int width) {
         return;
     }
 
+    /* Too narrow for an ellipsis: cut to "width" characters with no dots. */
     if (width <= 3) {
-        copy_len = (size_t)width;
-        if (copy_len >= dst_size) copy_len = dst_size - 1;
-        memcpy(dst, src, copy_len);
-        dst[copy_len] = '\0';
+        keep_chars = (size_t)width;
+        copy_bytes = utf8_byte_len_for_width(src, keep_chars);
+        /* Shrink to fit the buffer, then back off to a character boundary so a
+           multi-byte character is never cut in half. */
+        while (copy_bytes + 1 > dst_size) copy_bytes--;
+        while (copy_bytes > 0 && utf8_is_continuation((unsigned char)src[copy_bytes])) {
+            copy_bytes--;
+        }
+        memcpy(dst, src, copy_bytes);
+        dst[copy_bytes] = '\0';
         return;
     }
 
-    /* Need room for the text plus "..." plus the terminating NUL. If the buffer
-       is too small to hold even "...\0", fall back to a plain truncation so we
-       never write past the end of dst. */
-    if (dst_size < 5) {
-        copy_len = dst_size - 1;
-        memcpy(dst, src, copy_len);
-        dst[copy_len] = '\0';
+    /* Keep (width - 3) characters, then append "..." for a total of "width". */
+    keep_chars = (size_t)(width - 3);
+    copy_bytes = utf8_byte_len_for_width(src, keep_chars);
+
+    /* Make sure the bytes plus "...\0" fit the destination buffer. */
+    while (copy_bytes + 4 > dst_size && keep_chars > 0) {
+        keep_chars--;
+        copy_bytes = utf8_byte_len_for_width(src, keep_chars);
+    }
+    if (copy_bytes + 4 > dst_size) {            /* extreme: tiny buffer */
+        /* No room for text plus "...". Copy as many WHOLE characters as fit in
+           (dst_size - 1) bytes, so a multi-byte character is never split. */
+        size_t limit = dst_size - 1;
+        size_t pos = 0;
+        for (;;) {
+            size_t clen = 1;
+            while (src[pos + clen] != '\0' &&
+                   utf8_is_continuation((unsigned char)src[pos + clen])) {
+                clen++;
+            }
+            if (src[pos] == '\0' || pos + clen > limit) break;
+            pos += clen;
+        }
+        memcpy(dst, src, pos);
+        dst[pos] = '\0';
         return;
     }
 
-    copy_len = (size_t)(width - 3);
-    if (copy_len + 4 > dst_size) copy_len = dst_size - 4;
-    memcpy(dst, src, copy_len);
-    dst[copy_len] = '.';
-    dst[copy_len + 1] = '.';
-    dst[copy_len + 2] = '.';
-    dst[copy_len + 3] = '\0';
+    memcpy(dst, src, copy_bytes);
+    dst[copy_bytes] = '.';
+    dst[copy_bytes + 1] = '.';
+    dst[copy_bytes + 2] = '.';
+    dst[copy_bytes + 3] = '\0';
 }
 
 
@@ -376,7 +407,7 @@ static void append_padded(char *dst, size_t dst_size, const char *text, int widt
     crop_text(text, local, sizeof(local), width);
     append_raw(dst, dst_size, local);
 
-    len = (int)strlen(local);
+    len = (int)utf8_width(local);   /* pad by visible width, not bytes */
     for (i = len; i < width; i++) append_raw(dst, dst_size, " ");
 }
 
@@ -397,7 +428,7 @@ static void ui_line(Layout lay, const char *text, const char *color) {
 
     usable = lay.inner;
     crop_text(text, local, sizeof(local), usable);
-    len = (int)strlen(local);
+    len = (int)utf8_width(local);   /* pad by visible width, not bytes */
 
     print_indent(lay.left);
     printf("%c ", UI_VERTICAL);
@@ -418,7 +449,7 @@ static void ui_center_line(Layout lay, const char *text, const char *color) {
     int right_pad;
 
     crop_text(text, local, sizeof(local), lay.inner);
-    len = (int)strlen(local);
+    len = (int)utf8_width(local);   /* center by visible width, not bytes */
     left_pad = (lay.inner - len) / 2;
     right_pad = lay.inner - len - left_pad;
 
@@ -533,7 +564,7 @@ static void ui_key_value(const char *key, const char *value) {
     Layout lay;
     char k[MAX_NAME];
     char v[MAX_VALUE];
-    char line[1400];
+    char line[MAX_NAME + MAX_VALUE + 16];
 
     lay = get_layout();
     crop_text(key, k, sizeof(k), lay.key_width);
@@ -613,14 +644,12 @@ static int read_line_aligned(const char *label, int label_width, char *out, size
     return 1;
 }
 
-static int category_input_label_width(const Category *cat) {
+static int label_width_from_names(char names[][MAX_NAME], int count) {
     int width = 4;
     int i;
 
-    if (cat == NULL) return width;
-
-    for (i = 0; i < cat->field_count; i++) {
-        int len = (int)strlen(cat->fields[i].name);
+    for (i = 0; i < count; i++) {
+        int len = (int)strlen(names[i]);
         if (len > width) width = len;
     }
 
@@ -836,531 +865,6 @@ static void pause_enter(void) {
         clearerr(stdin);
     }
 }
-
-static int find_category(const Database *db, const char *name) {
-    int i;
-
-    if (db == NULL || name == NULL) return -1;
-
-    for (i = 0; i < db->category_count; i++) {
-        if (strings_equal_ci(db->categories[i].name, name)) return i;
-    }
-
-    return -1;
-}
-
-static int find_field(const Category *cat, const char *name) {
-    int i;
-
-    if (cat == NULL || name == NULL) return -1;
-
-    for (i = 0; i < cat->field_count; i++) {
-        if (strings_equal_ci(cat->fields[i].name, name)) return i;
-    }
-
-    return -1;
-}
-
-static int add_category_internal(Database *db, const char *name) {
-    int idx;
-
-    if (db == NULL || is_blank(name)) return -1;
-    if (db->category_count >= MAX_CATEGORIES) return -1;
-    if (find_category(db, name) >= 0) return -2;
-
-    idx = db->category_count;
-    db->category_count++;
-
-    memset(&db->categories[idx], 0, sizeof(db->categories[idx]));
-    safe_copy(db->categories[idx].name, sizeof(db->categories[idx].name), name);
-    db->dirty = 1;
-
-    return idx;
-}
-
-static int ensure_category(Database *db, const char *name) {
-    int idx;
-
-    idx = find_category(db, name);
-    if (idx >= 0) return idx;
-
-    return add_category_internal(db, name);
-}
-
-static int add_field_internal(Database *db, int category_index, const char *name) {
-    Category *cat;
-    int fi;
-    int i;
-
-    if (db == NULL || category_index < 0 || category_index >= db->category_count) return -1;
-    if (is_blank(name)) return -1;
-
-    cat = &db->categories[category_index];
-    if (cat->field_count >= MAX_FIELDS) return -1;
-    if (find_field(cat, name) >= 0) return -2;
-
-    fi = cat->field_count;
-    cat->field_count++;
-
-    memset(&cat->fields[fi], 0, sizeof(cat->fields[fi]));
-    safe_copy(cat->fields[fi].name, sizeof(cat->fields[fi].name), name);
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (db->items[i].used && strings_equal_ci(db->items[i].category, cat->name)) {
-            db->items[i].values[fi][0] = '\0';
-        }
-    }
-
-    db->dirty = 1;
-    return fi;
-}
-
-static int ensure_field(Database *db, int category_index, const char *name) {
-    int fi;
-
-    if (db == NULL || category_index < 0 || category_index >= db->category_count) return -1;
-
-    fi = find_field(&db->categories[category_index], name);
-    if (fi >= 0) return fi;
-
-    return add_field_internal(db, category_index, name);
-}
-
-static int count_items_in_category(const Database *db, const char *category) {
-    int i;
-    int count = 0;
-
-    if (db == NULL || category == NULL) return 0;
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (db->items[i].used && strings_equal_ci(db->items[i].category, category)) {
-            count++;
-        }
-    }
-
-    return count;
-}
-
-/* Fills "out" with the slot indices of every item in "category", ordered by the
-   item's current ID (ascending). Returns how many slots were written. */
-static int collect_sorted_slots(const Database *db, const char *category,
-                                int *out, int out_max) {
-    int i;
-    int j;
-    int n = 0;
-
-    if (db == NULL || category == NULL || out == NULL) return 0;
-
-    for (i = 0; i < MAX_ITEMS && n < out_max; i++) {
-        if (db->items[i].used && strings_equal_ci(db->items[i].category, category)) {
-            out[n++] = i;
-        }
-    }
-
-    /* Insertion sort by current ID: small, stable and safe for our sizes. */
-    for (i = 1; i < n; i++) {
-        int key = out[i];
-        int key_id = db->items[key].id;
-        j = i - 1;
-        while (j >= 0 && db->items[out[j]].id > key_id) {
-            out[j + 1] = out[j];
-            j--;
-        }
-        out[j + 1] = key;
-    }
-
-    return n;
-}
-
-/* Reassigns sequential IDs 1..N to the items of a category, keeping their order,
-   so the list never shows gaps after a deletion. */
-static void renumber_category(Database *db, const char *category) {
-    int order[MAX_ITEMS];
-    int n;
-    int i;
-
-    if (db == NULL || category == NULL) return;
-
-    n = collect_sorted_slots(db, category, order, MAX_ITEMS);
-    for (i = 0; i < n; i++) {
-        db->items[order[i]].id = i + 1;
-    }
-}
-
-/* Renumbers every category. Used right after loading so old files with gaps
-   (or items added across categories) always start clean and sequential. */
-static void renumber_all(Database *db) {
-    int c;
-    if (db == NULL) return;
-    for (c = 0; c < db->category_count; c++) {
-        renumber_category(db, db->categories[c].name);
-    }
-}
-
-static int find_item_slot_by_id(const Database *db, const char *category, int id) {
-    int i;
-
-    if (db == NULL || category == NULL) return -1;
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (db->items[i].used &&
-            db->items[i].id == id &&
-            strings_equal_ci(db->items[i].category, category)) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-static int allocate_item(Database *db, const char *category, int id) {
-    int i;
-
-    if (db == NULL || category == NULL || id <= 0) return -1;
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (!db->items[i].used) {
-            memset(&db->items[i], 0, sizeof(db->items[i]));
-            db->items[i].used = 1;
-            db->items[i].id = id;
-            safe_copy(db->items[i].category, sizeof(db->items[i].category), category);
-            db->item_count++;
-            if (id >= db->next_id) db->next_id = id + 1;
-            db->dirty = 1;
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-static void delete_item_slot(Database *db, int slot) {
-    if (db == NULL) return;
-    if (slot < 0 || slot >= MAX_ITEMS || !db->items[slot].used) return;
-
-    memset(&db->items[slot], 0, sizeof(db->items[slot]));
-    if (db->item_count > 0) db->item_count--;
-    db->dirty = 1;
-}
-
-static void csv_write_field(FILE *fp, const char *s) {
-    const char *p;
-    int must_quote = 0;
-
-    if (fp == NULL) return;
-    if (s == NULL) s = "";
-
-    for (p = s; *p; p++) {
-        if (*p == ',' || *p == '"' || *p == '\n' || *p == '\r') {
-            must_quote = 1;
-            break;
-        }
-    }
-
-    if (!must_quote) {
-        fputs(s, fp);
-        return;
-    }
-
-    fputc('"', fp);
-    for (p = s; *p; p++) {
-        if (*p == '"') fputc('"', fp);
-        fputc(*p, fp);
-    }
-    fputc('"', fp);
-}
-
-static void csv_write_row5(FILE *fp,
-                           const char *a,
-                           const char *b,
-                           const char *c,
-                           const char *d,
-                           const char *e) {
-    csv_write_field(fp, a); fputc(',', fp);
-    csv_write_field(fp, b); fputc(',', fp);
-    csv_write_field(fp, c); fputc(',', fp);
-    csv_write_field(fp, d); fputc(',', fp);
-    csv_write_field(fp, e); fputc('\n', fp);
-}
-
-static int csv_read_row(FILE *fp, char cells[MAX_CELLS][MAX_VALUE], int max_cells) {
-    char line[CSV_LINE];
-    int cell;
-    size_t out;
-    char *p;
-    int in_quotes;
-
-    if (fp == NULL || cells == NULL || max_cells <= 0) return 0;
-    if (fgets(line, sizeof(line), fp) == NULL) return 0;
-
-    for (cell = 0; cell < max_cells; cell++) cells[cell][0] = '\0';
-
-    cell = 0;
-    out = 0;
-    p = line;
-    in_quotes = 0;
-
-    while (*p != '\0') {
-        char ch = *p++;
-
-        if (ch == '\r' || ch == '\n') break;
-
-        if (in_quotes) {
-            if (ch == '"') {
-                if (*p == '"') {
-                    if (out + 1 < MAX_VALUE) cells[cell][out++] = '"';
-                    p++;
-                } else {
-                    in_quotes = 0;
-                }
-            } else {
-                if (out + 1 < MAX_VALUE) cells[cell][out++] = ch;
-            }
-        } else {
-            if (ch == '"' && out == 0) {
-                in_quotes = 1;
-            } else if (ch == ',') {
-                cells[cell][out] = '\0';
-                trim_in_place(cells[cell]);
-                cell++;
-                if (cell >= max_cells) return 1;
-                out = 0;
-            } else {
-                if (out + 1 < MAX_VALUE) cells[cell][out++] = ch;
-            }
-        }
-    }
-
-    if (cell < max_cells) {
-        cells[cell][out] = '\0';
-        trim_in_place(cells[cell]);
-    }
-
-    return 1;
-}
-
-static void init_database(Database *db) {
-    if (db == NULL) return;
-    memset(db, 0, sizeof(*db));
-    db->next_id = 1;
-}
-
-static int load_database(Database *db) {
-    FILE *fp;
-    char cells[MAX_CELLS][MAX_VALUE];
-
-    if (db == NULL) return 0;
-
-    init_database(db);
-    fp = fopen(DB_FILE, "r");
-    if (fp == NULL) return 0;
-
-    while (csv_read_row(fp, cells, MAX_CELLS)) {
-        if (cells[0][0] == '\0') continue;
-
-        if (strings_equal_ci(cells[0], "SCHEMA")) {
-            int ci;
-            if (is_blank(cells[1]) || is_blank(cells[3])) continue;
-            ci = ensure_category(db, cells[1]);
-            if (ci >= 0) (void)ensure_field(db, ci, cells[3]);
-        } else if (strings_equal_ci(cells[0], "ITEM")) {
-            int ci;
-            int fi;
-            int slot;
-            int id;
-
-            if (is_blank(cells[1]) || is_blank(cells[2]) || is_blank(cells[3])) continue;
-            if (!parse_int_strict(cells[2], 1, INT_MAX, &id)) continue;
-
-            ci = ensure_category(db, cells[1]);
-            if (ci < 0) continue;
-
-            fi = ensure_field(db, ci, cells[3]);
-            if (fi < 0) continue;
-
-            slot = find_item_slot_by_id(db, cells[1], id);
-            if (slot < 0) {
-                slot = allocate_item(db, cells[1], id);
-                if (slot < 0) {
-                    /* The file holds more items than fit in memory. Remember this
-                       so we can warn the user and refuse to overwrite the file,
-                       which protects the items we could not load. */
-                    g_load_truncated = 1;
-                }
-            }
-            if (slot >= 0) {
-                safe_copy(db->items[slot].values[fi],
-                          sizeof(db->items[slot].values[fi]),
-                          cells[4]);
-            }
-        } else if (strings_equal_ci(cells[0], "CREATED")) {
-            int slot;
-            int id;
-
-            if (is_blank(cells[1]) || is_blank(cells[2])) continue;
-            if (!parse_int_strict(cells[2], 1, INT_MAX, &id)) continue;
-
-            /* Create the item slot if it does not exist yet, so the timestamp
-               loads correctly no matter where the CREATED row sits in the file. */
-            if (ensure_category(db, cells[1]) < 0) continue;
-            slot = find_item_slot_by_id(db, cells[1], id);
-            if (slot < 0) {
-                slot = allocate_item(db, cells[1], id);
-                if (slot < 0) {
-                    g_load_truncated = 1;
-                }
-            }
-            if (slot >= 0) {
-                safe_copy(db->items[slot].created,
-                          sizeof(db->items[slot].created),
-                          cells[3]);
-            }
-        }
-    }
-
-    fclose(fp);
-    renumber_all(db);       /* guarantee clean 1..N IDs per category on open */
-    db->dirty = 0;
-    return 1;
-}
-
-static int save_database(Database *db) {
-    FILE *fp;
-    int c;
-    int f;
-    int i;
-    char idbuf[32];
-
-    if (db == NULL) return 0;
-
-    if (g_load_truncated) {
-        /* Safety guard: the file on disk has more data than this build can hold,
-           so writing now would erase the items we did not load. Refuse to save
-           and keep the original file untouched. */
-        return 0;
-    }
-
-    fp = fopen(DB_TEMP_FILE, "w");
-    if (fp == NULL) {
-        perror("Could not write temporary database");
-        return 0;
-    }
-
-    csv_write_row5(fp, "META", "APP", APP_NAME, "VERSION", "2");
-    csv_write_row5(fp,
-                   "META",
-                   "FORMAT",
-                   "normalized-csv",
-                   "NOTE",
-                   "Do not edit while the program is open");
-
-    for (c = 0; c < db->category_count; c++) {
-        for (f = 0; f < db->categories[c].field_count; f++) {
-            csv_write_row5(fp,
-                           "SCHEMA",
-                           db->categories[c].name,
-                           "",
-                           db->categories[c].fields[f].name,
-                           "");
-        }
-    }
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        int ci;
-        if (!db->items[i].used) continue;
-
-        ci = find_category(db, db->items[i].category);
-        if (ci < 0) continue;
-
-        snprintf(idbuf, sizeof(idbuf), "%d", db->items[i].id);
-
-        /* Persist the creation timestamp on its own row. Old files simply have
-           no CREATED rows, so this stays fully backward compatible. */
-        if (db->items[i].created[0] != '\0') {
-            csv_write_row5(fp,
-                           "CREATED",
-                           db->items[i].category,
-                           idbuf,
-                           db->items[i].created,
-                           "");
-        }
-
-        for (f = 0; f < db->categories[ci].field_count; f++) {
-            csv_write_row5(fp,
-                           "ITEM",
-                           db->items[i].category,
-                           idbuf,
-                           db->categories[ci].fields[f].name,
-                           db->items[i].values[f]);
-        }
-    }
-
-    if (fflush(fp) != 0) {
-        perror("Could not flush temporary database");
-        fclose(fp);
-        return 0;
-    }
-
-    if (fsync(fileno(fp)) != 0) {
-        perror("Could not sync temporary database");
-        fclose(fp);
-        return 0;
-    }
-
-    if (fclose(fp) != 0) {
-        perror("Could not close temporary database");
-        return 0;
-    }
-
-    if (rename(DB_TEMP_FILE, DB_FILE) != 0) {
-        perror("Could not replace database");
-        return 0;
-    }
-
-    db->dirty = 0;
-    return 1;
-}
-
-static void build_item_preview(const Database *db, int slot, char *out, size_t out_size) {
-    int ci;
-    int f;
-    int shown = 0;          /* how many fields we have added to the preview */
-
-    if (out == NULL || out_size == 0) return;
-    out[0] = '\0';
-
-    if (db == NULL || slot < 0 || slot >= MAX_ITEMS || !db->items[slot].used) return;
-
-    ci = find_category(db, db->items[slot].category);
-    if (ci < 0) return;
-
-    for (f = 0; f < db->categories[ci].field_count; f++) {
-        if (db->items[slot].values[f][0] != '\0') {
-            char piece[256];
-            size_t used = strlen(out);
-            int n;
-
-            n = snprintf(piece,
-                         sizeof(piece),
-                         "%s%s: %.80s",
-                         shown > 0 ? " | " : "",
-                         db->categories[ci].fields[f].name,
-                         db->items[slot].values[f]);
-            if (n < 0) continue;
-
-            /* Append only if it fits, leaving room for the terminating NUL. */
-            if (used + (size_t)n + 1 < out_size) {
-                memcpy(out + used, piece, (size_t)n + 1);
-                shown++;
-            }
-
-            if (shown >= 2) break;   /* a two-field preview is enough */
-        }
-    }
-
-    if (shown == 0) safe_copy(out, out_size, "empty item");
-}
-
 static void ui_table_header(const char *a, const char *b, const char *c, int aw, int bw, int cw) {
     Layout lay;
     char ac[128];
@@ -1428,100 +932,518 @@ static void ui_items_table_end(void) {
     lay = get_layout();
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
 }
+/* ============================================================================
+ *  Data layer - everything below talks to SQLite. The UI layer above never
+ *  touches SQL directly; it calls these helpers. All queries use prepared
+ *  statements with bound parameters, so user text can never be interpreted as
+ *  SQL (no injection possible).
+ *
+ *  Schema:
+ *    categories(id INTEGER PK, name TEXT UNIQUE, position INTEGER)
+ *    fields(id INTEGER PK, category_id INTEGER, name TEXT, position INTEGER)
+ *    items(id INTEGER PK, category_id INTEGER, seq INTEGER, created TEXT)
+ *    values(item_id INTEGER, field_id INTEGER, value TEXT)
+ *
+ *  "seq" is the per-category 1..N number shown to the user. It is recomputed
+ *  after deletes so the list never has gaps.
+ * ========================================================================== */
 
-static void print_item_table_row(const Database *db, int slot, int id_w, int category_w, int preview_w) {
+/* Show a database error to the user without crashing. */
+static void db_error(const char *what) {
+    print_indent(get_layout().left);
+    printf("%s" "Database error: %s" "%s\n",
+           COLOR_RED,
+           what != NULL ? what : "unknown",
+           COLOR_RESET);
+}
+
+/* Run a simple SQL statement that returns no rows. Returns 1 on success. */
+static int db_exec(const char *sql) {
+    char *err = NULL;
+    if (g_db == NULL) return 0;
+    if (sqlite3_exec(g_db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        db_error(err);
+        sqlite3_free(err);
+        return 0;
+    }
+    return 1;
+}
+
+/* Open the database and make sure the schema exists. Returns 1 on success. */
+static int db_open(void) {
+    static const char *schema =
+        "PRAGMA journal_mode=WAL;"          /* durable + fast, survives crashes */
+        "PRAGMA synchronous=FULL;"          /* never lose a committed change */
+        "PRAGMA foreign_keys=ON;"
+        "CREATE TABLE IF NOT EXISTS categories("
+        "  id INTEGER PRIMARY KEY,"
+        "  name TEXT NOT NULL UNIQUE,"
+        "  position INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS fields("
+        "  id INTEGER PRIMARY KEY,"
+        "  category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,"
+        "  name TEXT NOT NULL,"
+        "  position INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS items("
+        "  id INTEGER PRIMARY KEY,"
+        "  category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,"
+        "  seq INTEGER NOT NULL,"
+        "  created TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE IF NOT EXISTS item_values("
+        "  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,"
+        "  field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,"
+        "  value TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY(item_id, field_id));"
+        "CREATE INDEX IF NOT EXISTS idx_fields_cat ON fields(category_id, position);"
+        "CREATE INDEX IF NOT EXISTS idx_items_cat ON items(category_id, seq);"
+        "CREATE INDEX IF NOT EXISTS idx_values_item ON item_values(item_id);";
+
+    if (sqlite3_open(DB_FILE, &g_db) != SQLITE_OK) {
+        db_error(sqlite3_errmsg(g_db));
+        return 0;
+    }
+    /* Wait up to 5s if the file is briefly locked instead of failing. */
+    sqlite3_busy_timeout(g_db, 5000);
+    return db_exec(schema);
+}
+
+static void db_close(void) {
+    if (g_db != NULL) {
+        sqlite3_close(g_db);
+        g_db = NULL;
+    }
+}
+
+/* ---- small query helpers ---- */
+
+/* Returns a single integer from a query (e.g. COUNT). default_value on error. */
+static long db_query_long(const char *sql, int bind_id, long default_value) {
+    sqlite3_stmt *st = NULL;
+    long result = default_value;
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return default_value;
+    if (bind_id >= 0) sqlite3_bind_int(st, 1, bind_id);
+    if (sqlite3_step(st) == SQLITE_ROW) result = (long)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return result;
+}
+
+static int total_categories(void) {
+    return (int)db_query_long("SELECT COUNT(*) FROM categories;", -1, 0);
+}
+
+static int total_items(void) {
+    return (int)db_query_long("SELECT COUNT(*) FROM items;", -1, 0);
+}
+
+/* Looks up a category id by its position in the list (1-based). 0 if none. */
+static sqlite3_int64 category_id_at(int list_index) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 id = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id FROM categories ORDER BY position, id LIMIT 1 OFFSET ?;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, list_index);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return id;
+}
+
+/* Copies a category's name into out. Returns 1 if found. */
+static int category_name(sqlite3_int64 cat_id, char *out, size_t out_size) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+
+    if (out == NULL || out_size == 0) return 0;
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(g_db, "SELECT name FROM categories WHERE id=?;",
+                           -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *txt = sqlite3_column_text(st, 0);
+        safe_copy(out, out_size, (const char *)txt);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Does a category with this name already exist? */
+static int category_exists(const char *name) {
+    sqlite3_stmt *st = NULL;
+    int exists = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT 1 FROM categories WHERE name=? COLLATE NOCASE LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) exists = 1;
+    sqlite3_finalize(st);
+    return exists;
+}
+
+/* Creates a category, returns its id, or 0 on failure. */
+static sqlite3_int64 category_create(const char *name) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 id = 0;
+    int next_pos = (int)db_query_long(
+        "SELECT COALESCE(MAX(position)+1,0) FROM categories;", -1, 0);
+
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO categories(name, position) VALUES(?, ?);",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, next_pos);
+    if (sqlite3_step(st) == SQLITE_DONE) id = sqlite3_last_insert_rowid(g_db);
+    sqlite3_finalize(st);
+    return id;
+}
+
+/* Adds a field to a category. Returns 1 on success, 0 on failure,
+   -2 if a field with the same name already exists (duplicate). */
+static int field_add(sqlite3_int64 cat_id, const char *name) {
+    sqlite3_stmt *st = NULL;
+    int dup = 0;
+    int next_pos;
+    int ok = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT 1 FROM fields WHERE category_id=? AND name=? COLLATE NOCASE;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) dup = 1;
+    sqlite3_finalize(st);
+    if (dup) return -2;
+
+    next_pos = (int)db_query_long(
+        "SELECT COALESCE(MAX(position)+1,0) FROM fields WHERE category_id=?;",
+        (int)cat_id, 0);
+
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO fields(category_id, name, position) VALUES(?, ?, ?);",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, next_pos);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static int field_count(sqlite3_int64 cat_id) {
+    return (int)db_query_long(
+        "SELECT COUNT(*) FROM fields WHERE category_id=?;", (int)cat_id, 0);
+}
+
+/* Loads a category's field names and ids (ordered). Returns the count, capped
+   at max_fields. */
+static int field_load(sqlite3_int64 cat_id,
+                      char names[][MAX_NAME], sqlite3_int64 *ids, int max_fields) {
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, name FROM fields WHERE category_id=? ORDER BY position, id;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    while (n < max_fields && sqlite3_step(st) == SQLITE_ROW) {
+        if (ids != NULL) ids[n] = sqlite3_column_int64(st, 0);
+        safe_copy(names[n], MAX_NAME, (const char *)sqlite3_column_text(st, 1));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int count_items_in_category(sqlite3_int64 cat_id) {
+    return (int)db_query_long(
+        "SELECT COUNT(*) FROM items WHERE category_id=?;", (int)cat_id, 0);
+}
+
+/* Renumber a category's items to 1..N by current seq order, closing any gap. */
+static int renumber_category(sqlite3_int64 cat_id) {
+    /* Two-step to avoid UNIQUE clashes is not needed (seq is not unique), so a
+       single correlated update suffices and runs inside the caller's
+       transaction. */
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "WITH ordered AS ("
+            "  SELECT id, ROW_NUMBER() OVER (ORDER BY seq, id) AS rn"
+            "  FROM items WHERE category_id=?1)"
+            "UPDATE items SET seq=(SELECT rn FROM ordered WHERE ordered.id=items.id)"
+            "  WHERE category_id=?1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, cat_id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Finds an item's row id from its per-category seq number. 0 if not found. */
+static sqlite3_int64 item_id_by_seq(sqlite3_int64 cat_id, int seq) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 id = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id FROM items WHERE category_id=? AND seq=?;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    sqlite3_bind_int(st, 2, seq);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return id;
+}
+
+/* Creates a new item in a category with a fresh sequential seq and ISO date,
+   then stores its field values. Returns the new item id, or 0 on failure.
+   values[] aligns with the fields returned by field_load. */
+static sqlite3_int64 item_create(sqlite3_int64 cat_id,
+                                 char values[][MAX_VALUE], int value_count) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 item_id = 0;
+    sqlite3_int64 field_ids[MAX_FIELDS];
+    char field_names[MAX_FIELDS][MAX_NAME];
+    int nf;
+    int i;
+    int next_seq;
+    char created[32];
+
+    if (!db_exec("BEGIN IMMEDIATE;")) return 0;
+
+    next_seq = count_items_in_category(cat_id) + 1;
+    iso8601_now(created, sizeof(created));
+
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO items(category_id, seq, created) VALUES(?, ?, ?);",
+            -1, &st, NULL) != SQLITE_OK) { db_exec("ROLLBACK;"); return 0; }
+    sqlite3_bind_int64(st, 1, cat_id);
+    sqlite3_bind_int(st, 2, next_seq);
+    sqlite3_bind_text(st, 3, created, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); db_exec("ROLLBACK;"); return 0; }
+    sqlite3_finalize(st);
+    item_id = sqlite3_last_insert_rowid(g_db);
+
+    nf = field_load(cat_id, field_names, field_ids, MAX_FIELDS);
+    for (i = 0; i < nf && i < value_count; i++) {
+        if (sqlite3_prepare_v2(g_db,
+                "INSERT INTO item_values(item_id, field_id, value) VALUES(?, ?, ?);",
+                -1, &st, NULL) != SQLITE_OK) { db_exec("ROLLBACK;"); return 0; }
+        sqlite3_bind_int64(st, 1, item_id);
+        sqlite3_bind_int64(st, 2, field_ids[i]);
+        sqlite3_bind_text(st, 3, values[i], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); db_exec("ROLLBACK;"); return 0; }
+        sqlite3_finalize(st);
+    }
+
+    if (!db_exec("COMMIT;")) { db_exec("ROLLBACK;"); return 0; }
+    return item_id;
+}
+
+/* Reads the created timestamp of an item. */
+static void item_created(sqlite3_int64 item_id, char *out, size_t out_size) {
+    sqlite3_stmt *st = NULL;
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(g_db, "SELECT created FROM items WHERE id=?;",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, item_id);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        safe_copy(out, out_size, (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+}
+
+/* Reads one field value of an item by field id. */
+static void item_value(sqlite3_int64 item_id, sqlite3_int64 field_id,
+                       char *out, size_t out_size) {
+    sqlite3_stmt *st = NULL;
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT value FROM item_values WHERE item_id=? AND field_id=?;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, item_id);
+    sqlite3_bind_int64(st, 2, field_id);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        safe_copy(out, out_size, (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+}
+
+/* Sets one field value of an item (insert or update). Returns 1 on success. */
+static int item_value_set(sqlite3_int64 item_id, sqlite3_int64 field_id,
+                          const char *value) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO item_values(item_id, field_id, value) VALUES(?, ?, ?)"
+            " ON CONFLICT(item_id, field_id) DO UPDATE SET value=excluded.value;",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, item_id);
+    sqlite3_bind_int64(st, 2, field_id);
+    sqlite3_bind_text(st, 3, value, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Deletes an item and renumbers its category. Returns 1 on success. */
+static int item_delete(sqlite3_int64 cat_id, sqlite3_int64 item_id) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+
+    if (!db_exec("BEGIN IMMEDIATE;")) return 0;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM items WHERE id=?;",
+                           -1, &st, NULL) != SQLITE_OK) { db_exec("ROLLBACK;"); return 0; }
+    sqlite3_bind_int64(st, 1, item_id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+    sqlite3_finalize(st);
+    if (ok) ok = renumber_category(cat_id);
+    if (ok && db_exec("COMMIT;")) return 1;
+    db_exec("ROLLBACK;");
+    return 0;
+}
+
+static int category_delete(sqlite3_int64 cat_id) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM categories WHERE id=?;",
+                           -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, cat_id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+/* ============================================================================
+ *  Operations layer - the menu actions. Same look and behavior as before, but
+ *  every action reads/writes through the SQLite data layer above.
+ * ========================================================================== */
+
+/* Builds a short "FieldA: x | FieldB: y" preview for an item (first 2 fields). */
+static void build_item_preview(sqlite3_int64 item_id, sqlite3_int64 cat_id,
+                               char *out, size_t out_size) {
+    char names[MAX_FIELDS][MAX_NAME];
+    sqlite3_int64 ids[MAX_FIELDS];
+    int nf;
+    int f;
+    int shown = 0;
+
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+
+    nf = field_load(cat_id, names, ids, MAX_FIELDS);
+    for (f = 0; f < nf; f++) {
+        char value[MAX_VALUE];
+        item_value(item_id, ids[f], value, sizeof(value));
+        if (value[0] != '\0') {
+            char piece[256];
+            size_t used = strlen(out);
+            int n = snprintf(piece, sizeof(piece), "%s%s: %.80s",
+                             shown > 0 ? " | " : "", names[f], value);
+            if (n < 0) continue;
+            if (used + (size_t)n + 1 < out_size) {
+                memcpy(out + used, piece, (size_t)n + 1);
+                shown++;
+            }
+            if (shown >= 2) break;
+        }
+    }
+    if (shown == 0) safe_copy(out, out_size, "empty item");
+}
+
+static void print_item_table_row(sqlite3_int64 item_id, sqlite3_int64 cat_id,
+                                 int seq, const char *cat_name,
+                                 int id_w, int category_w, int preview_w) {
     char idbuf[32];
     char preview[512];
 
-    if (db == NULL || slot < 0 || slot >= MAX_ITEMS || !db->items[slot].used) return;
-
-    snprintf(idbuf, sizeof(idbuf), "%d", db->items[slot].id);
-    build_item_preview(db, slot, preview, sizeof(preview));
-    ui_table_row(idbuf, db->items[slot].category, preview, id_w, category_w, preview_w);
+    snprintf(idbuf, sizeof(idbuf), "%d", seq);
+    build_item_preview(item_id, cat_id, preview, sizeof(preview));
+    ui_table_row(idbuf, cat_name, preview, id_w, category_w, preview_w);
 }
 
-static void view_item(Database *db, int slot) {
-    int ci;
+static void view_item(sqlite3_int64 cat_id, int seq) {
+    sqlite3_int64 item_id;
+    char cat[MAX_NAME];
+    char created[32];
+    char names[MAX_FIELDS][MAX_NAME];
+    sqlite3_int64 ids[MAX_FIELDS];
+    char title[160];
+    int nf;
     int f;
-    char title[128];
     Layout lay;
 
-    if (db == NULL || slot < 0 || slot >= MAX_ITEMS || !db->items[slot].used) return;
+    item_id = item_id_by_seq(cat_id, seq);
+    if (item_id == 0) return;
+    category_name(cat_id, cat, sizeof(cat));
 
-    ci = find_category(db, db->items[slot].category);
-    snprintf(title, sizeof(title), "Viewing item ID %d", db->items[slot].id);
-    ui_header(title, db->items[slot].category);
+    snprintf(title, sizeof(title), "Viewing item ID %d", seq);
+    ui_header(title, cat);
 
     lay = get_layout();
     ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
 
-    if (ci < 0) {
-        ui_line(lay, "Category not found.", COLOR_RED);
-    } else {
-        if (db->items[slot].created[0] != '\0') {
-            ui_key_value("Created", db->items[slot].created);
-        }
-        for (f = 0; f < db->categories[ci].field_count; f++) {
-            ui_key_value(db->categories[ci].fields[f].name, db->items[slot].values[f]);
-        }
+    item_created(item_id, created, sizeof(created));
+    if (created[0] != '\0') ui_key_value("Created", created);
+
+    nf = field_load(cat_id, names, ids, MAX_FIELDS);
+    for (f = 0; f < nf; f++) {
+        char value[MAX_VALUE];
+        item_value(item_id, ids[f], value, sizeof(value));
+        ui_key_value(names[f], value);
     }
 
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     pause_enter();
 }
 
-static void list_items_in_category(Database *db, int ci) {
-    int i;
-    int shown = 0;
+static void list_items_in_category(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
+    sqlite3_stmt *st = NULL;
     int id_w;
     int category_w;
     int preview_w;
+    int shown = 0;
     int choice;
-    Category *cat;
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-
-    cat = &db->categories[ci];
-    ui_header("List items", cat->name);
-
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("List items", cat);
     ui_items_table_begin(&id_w, &category_w, &preview_w);
 
-    {
-        int order[MAX_ITEMS];
-        int n;
-        int k;
-
-        n = collect_sorted_slots(db, cat->name, order, MAX_ITEMS);
-        for (k = 0; k < n; k++) {
-            i = order[k];
-            print_item_table_row(db, i, id_w, category_w, preview_w);
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, seq FROM items WHERE category_id=? ORDER BY seq;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, cat_id);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            sqlite3_int64 item_id = sqlite3_column_int64(st, 0);
+            int seq = sqlite3_column_int(st, 1);
+            print_item_table_row(item_id, cat_id, seq, cat, id_w, category_w, preview_w);
             shown++;
             if (shown % PAGE_LINES == 0) {
                 ui_items_table_end();
                 pause_enter();
-                ui_header("List items", cat->name);
+                ui_header("List items", cat);
                 ui_items_table_begin(&id_w, &category_w, &preview_w);
             }
         }
+        sqlite3_finalize(st);
     }
 
     if (shown == 0) {
-        ui_table_row("-", cat->name, "No items registered yet.", id_w, category_w, preview_w);
+        ui_table_row("-", cat, "No items registered yet.", id_w, category_w, preview_w);
     }
-
     ui_items_table_end();
 
-    if (shown == 0) {
-        pause_enter();
-        return;
-    }
+    if (shown == 0) { pause_enter(); return; }
 
     choice = read_int_range("Item ID to view, or 0:", 0, INT_MAX);
     if (choice != 0 && choice != INPUT_CANCEL) {
-        int slot;
-        slot = find_item_slot_by_id(db, cat->name, choice);
-        if (slot >= 0) {
-            view_item(db, slot);
+        if (item_id_by_seq(cat_id, choice) != 0) {
+            view_item(cat_id, choice);
         } else {
             print_indent(get_layout().left);
             printf("%s" "Item not found.\n" "%s", COLOR_YELLOW, COLOR_RESET);
@@ -1530,28 +1452,24 @@ static void list_items_in_category(Database *db, int ci) {
     }
 }
 
-static void add_item(Database *db, int ci) {
-    int slot;
+static void add_item(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
+    char names[MAX_FIELDS][MAX_NAME];
+    sqlite3_int64 ids[MAX_FIELDS];
+    char values[MAX_FIELDS][MAX_VALUE];
+    int nf;
     int f;
-    int id;
     int label_width;
-    Category *cat;
+    sqlite3_int64 new_id;
     Layout lay;
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-    cat = &db->categories[ci];
-
-    ui_header("Add new item", cat->name);
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("Add new item", cat);
     lay = get_layout();
 
-    if (cat->field_count <= 0) {
+    nf = field_load(cat_id, names, ids, MAX_FIELDS);
+    if (nf <= 0) {
         ui_message_box("This category has no fields. Add fields first.", COLOR_YELLOW);
-        pause_enter();
-        return;
-    }
-
-    if (db->item_count >= MAX_ITEMS) {
-        ui_message_box("Item limit reached.", COLOR_RED);
         pause_enter();
         return;
     }
@@ -1562,128 +1480,116 @@ static void add_item(Database *db, int ci) {
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     putchar('\n');
 
-    /* Sequential per-category ID. Items stay numbered 1..N with no gaps. */
-    id = count_items_in_category(db, cat->name) + 1;
-    slot = allocate_item(db, cat->name, id);
-    if (slot < 0) {
-        ui_message_box("Could not allocate item.", COLOR_RED);
-        pause_enter();
-        return;
-    }
+    label_width = label_width_from_names(names, nf);
 
-    /* Stamp the creation time in ISO 8601 (e.g. 2026-05-29T20:17:08). */
-    iso8601_now(db->items[slot].created, sizeof(db->items[slot].created));
-
-    label_width = category_input_label_width(cat);
-
-    for (f = 0; f < cat->field_count; f++) {
-        if (!read_line_aligned(cat->fields[f].name,
-                               label_width,
-                               db->items[slot].values[f],
-                               sizeof(db->items[slot].values[f]))) {
-            delete_item_slot(db, slot);
+    for (f = 0; f < nf; f++) {
+        values[f][0] = '\0';
+        if (!read_line_aligned(names[f], label_width, values[f], sizeof(values[f]))) {
             ui_message_box("Input canceled. Item was not saved.", COLOR_YELLOW);
             pause_enter();
             return;
         }
     }
 
-    db->dirty = 1;
-    if (save_database(db)) {
+    new_id = item_create(cat_id, values, nf);
+    if (new_id != 0) {
         char message[96];
-        snprintf(message, sizeof(message), "Item saved with ID %d.", db->items[slot].id);
+        int seq = (int)db_query_long("SELECT seq FROM items WHERE id=?;", (int)new_id, 0);
+        snprintf(message, sizeof(message), "Item saved with ID %d.", seq);
         putchar('\n');
         ui_message_box(message, COLOR_GREEN);
     } else {
-        ui_message_box("Save failed. Check file permissions.", COLOR_RED);
+        ui_message_box("Save failed.", COLOR_RED);
     }
     pause_enter();
 }
 
-static void edit_item(Database *db, int ci) {
-    int id;
-    int slot;
+static void edit_item(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
+    char names[MAX_FIELDS][MAX_NAME];
+    sqlite3_int64 ids[MAX_FIELDS];
+    sqlite3_int64 item_id;
+    char title[160];
+    int seq;
+    int nf;
     int f;
     int label_width;
-    Category *cat;
-    char title[128];
+    int changed = 0;
     Layout lay;
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-    cat = &db->categories[ci];
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("Edit item", cat);
+    seq = read_int_range("Item ID:", 1, INT_MAX);
+    if (seq == INPUT_CANCEL) return;
 
-    ui_header("Edit item", cat->name);
-    id = read_int_range("Item ID:", 1, INT_MAX);
-    if (id == INPUT_CANCEL) return;
-
-    slot = find_item_slot_by_id(db, cat->name, id);
-    if (slot < 0) {
+    item_id = item_id_by_seq(cat_id, seq);
+    if (item_id == 0) {
         ui_message_box("Item not found.", COLOR_YELLOW);
         pause_enter();
         return;
     }
 
-    snprintf(title, sizeof(title), "Editing item ID %d", id);
-    ui_header(title, cat->name);
+    snprintf(title, sizeof(title), "Editing item ID %d", seq);
+    ui_header(title, cat);
     lay = get_layout();
+
+    nf = field_load(cat_id, names, ids, MAX_FIELDS);
 
     ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
     ui_center_line(lay, "Current values", COLOR_GREEN);
-    for (f = 0; f < cat->field_count; f++) {
-        ui_key_value(cat->fields[f].name, db->items[slot].values[f]);
+    for (f = 0; f < nf; f++) {
+        char value[MAX_VALUE];
+        item_value(item_id, ids[f], value, sizeof(value));
+        ui_key_value(names[f], value);
     }
     ui_blank_line(lay);
     ui_line(lay, "Press ENTER without text to keep the current value.", COLOR_DIM);
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     putchar('\n');
 
-    label_width = category_input_label_width(cat);
+    label_width = label_width_from_names(names, nf);
 
-    for (f = 0; f < cat->field_count; f++) {
+    if (!db_exec("BEGIN IMMEDIATE;")) { pause_enter(); return; }
+    for (f = 0; f < nf; f++) {
         char line[MAX_VALUE];
-
-        if (read_line_aligned(cat->fields[f].name, label_width, line, sizeof(line)) && line[0] != '\0') {
-            safe_copy(db->items[slot].values[f], sizeof(db->items[slot].values[f]), line);
-            db->dirty = 1;
+        if (read_line_aligned(names[f], label_width, line, sizeof(line)) && line[0] != '\0') {
+            if (item_value_set(item_id, ids[f], line)) changed = 1;
         }
     }
 
-    if (db->dirty && save_database(db)) {
+    if (changed && db_exec("COMMIT;")) {
         putchar('\n');
         ui_message_box("Item updated.", COLOR_GREEN);
     } else {
+        db_exec("ROLLBACK;");
         putchar('\n');
         ui_message_box("No changes were saved.", COLOR_DIM);
     }
     pause_enter();
 }
 
-static void delete_item(Database *db, int ci) {
-    int id;
-    int slot;
-    Category *cat;
+static void delete_item_ui(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
+    sqlite3_int64 item_id;
+    int seq;
     char question[160];
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-    cat = &db->categories[ci];
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("Delete item", cat);
+    seq = read_int_range("Item ID:", 1, INT_MAX);
+    if (seq == INPUT_CANCEL) return;
 
-    ui_header("Delete item", cat->name);
-    id = read_int_range("Item ID:", 1, INT_MAX);
-    if (id == INPUT_CANCEL) return;
-
-    slot = find_item_slot_by_id(db, cat->name, id);
-    if (slot < 0) {
+    item_id = item_id_by_seq(cat_id, seq);
+    if (item_id == 0) {
         print_indent(get_layout().left);
         printf("%s" "Item not found.\n" "%s", COLOR_YELLOW, COLOR_RESET);
         pause_enter();
         return;
     }
 
-    snprintf(question, sizeof(question), "Delete item ID %d permanently?", id);
+    snprintf(question, sizeof(question), "Delete item ID %d permanently?", seq);
     if (confirm_action(question)) {
-        delete_item_slot(db, slot);
-        renumber_category(db, cat->name);   /* close the gap: 1,2,3,... again */
-        if (save_database(db)) {
+        if (item_delete(cat_id, item_id)) {
             print_indent(get_layout().left);
             printf("%s" "Item deleted.\n" "%s", COLOR_GREEN, COLOR_RESET);
         }
@@ -1691,73 +1597,83 @@ static void delete_item(Database *db, int ci) {
         print_indent(get_layout().left);
         printf("%s" "Canceled.\n" "%s", COLOR_DIM, COLOR_RESET);
     }
-
     pause_enter();
 }
 
-static int item_matches(const Database *db, int slot, int ci, const char *term) {
-    int f;
-    int real_ci;
-
-    if (db == NULL || term == NULL) return 0;
-    if (slot < 0 || slot >= MAX_ITEMS || !db->items[slot].used) return 0;
-
-    if (ci >= 0) {
-        if (!strings_equal_ci(db->items[slot].category, db->categories[ci].name)) return 0;
-        real_ci = ci;
-    } else {
-        real_ci = find_category(db, db->items[slot].category);
-        if (real_ci < 0) return 0;
-    }
-
-    if (contains_ci(db->items[slot].category, term)) return 1;
-
-    for (f = 0; f < db->categories[real_ci].field_count; f++) {
-        if (contains_ci(db->categories[real_ci].fields[f].name, term)) return 1;
-        if (contains_ci(db->items[slot].values[f], term)) return 1;
-    }
-
-    return 0;
-}
-
-static void search_items(Database *db, int ci) {
+/* Search. cat_id == 0 means search every category. Uses LIKE with an escaped
+   pattern so the user's text is matched literally, not as wildcards. */
+static void search_items(sqlite3_int64 cat_id) {
     char term[MAX_VALUE];
-    int i;
-    int found = 0;
-    int shown = 0;
+    char pattern[MAX_VALUE + 8];
+    char subtitle[MAX_NAME];
+    sqlite3_stmt *st = NULL;
     int id_w;
     int category_w;
     int preview_w;
-    const char *subtitle;
+    int found = 0;
+    size_t i;
+    size_t p = 0;
 
-    if (db == NULL) return;
+    if (cat_id != 0) category_name(cat_id, subtitle, sizeof(subtitle));
+    else safe_copy(subtitle, sizeof(subtitle), "All categories");
 
-    subtitle = ci >= 0 ? db->categories[ci].name : "All categories";
     ui_header("Search", subtitle);
-
     if (!read_required_line("Search text:", term, sizeof(term))) return;
+
+    /* Build a LIKE pattern: %term%, escaping % _ and the escape char itself. */
+    pattern[p++] = '%';
+    for (i = 0; term[i] != '\0' && p < sizeof(pattern) - 3; i++) {
+        char ch = term[i];
+        if (ch == '%' || ch == '_' || ch == '\\') pattern[p++] = '\\';
+        pattern[p++] = ch;
+    }
+    pattern[p++] = '%';
+    pattern[p] = '\0';
 
     ui_header("Search results", term);
     ui_items_table_begin(&id_w, &category_w, &preview_w);
 
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (item_matches(db, i, ci, term)) {
-            print_item_table_row(db, i, id_w, category_w, preview_w);
-            found++;
-            shown++;
-            if (shown % PAGE_LINES == 0) {
-                ui_items_table_end();
-                pause_enter();
-                ui_header("Search results", term);
-                ui_items_table_begin(&id_w, &category_w, &preview_w);
+    {
+        const char *sql_all =
+            "SELECT DISTINCT i.id, i.seq, c.id, c.name FROM items i "
+            "JOIN categories c ON c.id=i.category_id "
+            "LEFT JOIN item_values v ON v.item_id=i.id "
+            "WHERE c.name LIKE ?1 ESCAPE '\\' "
+            "   OR v.value LIKE ?1 ESCAPE '\\' "
+            "ORDER BY c.position, i.seq;";
+        const char *sql_one =
+            "SELECT DISTINCT i.id, i.seq, c.id, c.name FROM items i "
+            "JOIN categories c ON c.id=i.category_id "
+            "LEFT JOIN item_values v ON v.item_id=i.id "
+            "WHERE i.category_id=?2 AND (c.name LIKE ?1 ESCAPE '\\' "
+            "   OR v.value LIKE ?1 ESCAPE '\\') "
+            "ORDER BY i.seq;";
+
+        if (sqlite3_prepare_v2(g_db, cat_id != 0 ? sql_one : sql_all,
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, pattern, -1, SQLITE_TRANSIENT);
+            if (cat_id != 0) sqlite3_bind_int64(st, 2, cat_id);
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                sqlite3_int64 item_id = sqlite3_column_int64(st, 0);
+                int seq = sqlite3_column_int(st, 1);
+                sqlite3_int64 ccid = sqlite3_column_int64(st, 2);
+                const char *cname = (const char *)sqlite3_column_text(st, 3);
+                print_item_table_row(item_id, ccid, seq, cname, id_w, category_w, preview_w);
+                found++;
+                if (found % PAGE_LINES == 0) {
+                    ui_items_table_end();
+                    pause_enter();
+                    ui_header("Search results", term);
+                    ui_items_table_begin(&id_w, &category_w, &preview_w);
+                }
             }
+            sqlite3_finalize(st);
         }
     }
 
     if (found == 0) {
         ui_table_row("-", subtitle, "No matching items.", id_w, category_w, preview_w);
     }
-
     ui_items_table_end();
     putchar('\n');
     print_indent(get_layout().left);
@@ -1765,40 +1681,34 @@ static void search_items(Database *db, int ci) {
     pause_enter();
 }
 
-static void add_category_ui(Database *db) {
+static void add_category_ui(void) {
     char name[MAX_NAME];
-    int ci;
+    sqlite3_int64 cat_id;
     int n;
     int i;
-
-    if (db == NULL) return;
 
     ui_header("Create category", "Examples: Movies, Books, Places, Goals, Home Items");
 
     if (!read_required_line("Category name:", name, sizeof(name))) return;
 
-    ci = add_category_internal(db, name);
-    if (ci == -2) {
+    if (category_exists(name)) {
         print_indent(get_layout().left);
         printf("%s" "A category with this name already exists.\n" "%s", COLOR_YELLOW, COLOR_RESET);
         pause_enter();
         return;
     }
-    if (ci < 0) {
+
+    cat_id = category_create(name);
+    if (cat_id == 0) {
         print_indent(get_layout().left);
-        printf("%s" "Category limit reached.\n" "%s", COLOR_RED, COLOR_RESET);
+        printf("%s" "Could not create the category.\n" "%s", COLOR_RED, COLOR_RESET);
         pause_enter();
         return;
     }
 
     n = read_int_range("Custom fields:", 1, MAX_FIELDS);
     if (n == INPUT_CANCEL) {
-        /* ESC at this point cancels the whole action. The category was created
-           in memory a moment ago, so we undo it and save nothing. It is always
-           the last category in the array, which makes removal simple and safe. */
-        memset(&db->categories[ci], 0, sizeof(db->categories[ci]));
-        if (db->category_count > 0) db->category_count--;
-        db->dirty = 0;
+        category_delete(cat_id);   /* undo: nothing was committed for the user */
         print_indent(get_layout().left);
         printf("%s" "Canceled. The category was not created.\n" "%s", COLOR_DIM, COLOR_RESET);
         pause_enter();
@@ -1811,13 +1721,9 @@ static void add_category_ui(Database *db) {
         int r;
 
         snprintf(prompt, sizeof(prompt), "Field %d name:", i + 1);
-        if (!read_required_line(prompt, field, sizeof(field))) {
-            /* ESC while typing field names: keep the fields already added. If
-               none were added yet, cancel the whole category like above. */
-            break;
-        }
+        if (!read_required_line(prompt, field, sizeof(field))) break;
 
-        r = add_field_internal(db, ci, field);
+        r = field_add(cat_id, field);
         if (r == -2) {
             print_indent(get_layout().left);
             printf("%s" "Duplicated field ignored. Try another name.\n" "%s", COLOR_YELLOW, COLOR_RESET);
@@ -1825,30 +1731,26 @@ static void add_category_ui(Database *db) {
         }
     }
 
-    if (db->categories[ci].field_count == 0) {
-        /* A category with no fields cannot store anything, so do not keep it. */
-        memset(&db->categories[ci], 0, sizeof(db->categories[ci]));
-        if (db->category_count > 0) db->category_count--;
-        db->dirty = 0;
+    if (field_count(cat_id) == 0) {
+        category_delete(cat_id);
         print_indent(get_layout().left);
         printf("%s" "Canceled. A category needs at least one field.\n" "%s", COLOR_DIM, COLOR_RESET);
         pause_enter();
         return;
     }
 
-    if (save_database(db)) {
-        putchar('\n');
-        print_indent(get_layout().left);
-        printf("%s" "Category created.\n" "%s", COLOR_GREEN, COLOR_RESET);
-    }
+    putchar('\n');
+    print_indent(get_layout().left);
+    printf("%s" "Category created.\n" "%s", COLOR_GREEN, COLOR_RESET);
     pause_enter();
 }
 
-static void list_categories_table(Database *db) {
-    int i;
+static void list_categories_table(void) {
+    sqlite3_stmt *st = NULL;
     int num_w;
     int name_w;
     int info_w;
+    int row = 0;
     Layout lay;
 
     lay = get_layout();
@@ -1863,80 +1765,75 @@ static void list_categories_table(Database *db) {
     ui_table_header("NO", "CATEGORY", "ITEMS / FIELDS", num_w, name_w, info_w);
     ui_rule(lay, '+', UI_HORIZONTAL, '+');
 
-    if (db->category_count == 0) {
-        ui_table_row("-", "No categories yet", "Create one first", num_w, name_w, info_w);
-    } else {
-        for (i = 0; i < db->category_count; i++) {
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, name FROM categories ORDER BY position, id;",
+            -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            sqlite3_int64 cid = sqlite3_column_int64(st, 0);
+            const char *cname = (const char *)sqlite3_column_text(st, 1);
             char nbuf[16];
             char ibuf[80];
-            snprintf(nbuf, sizeof(nbuf), "%d", i + 1);
-            snprintf(ibuf,
-                     sizeof(ibuf),
-                     "%d item(s), %d field(s)",
-                     count_items_in_category(db, db->categories[i].name),
-                     db->categories[i].field_count);
-            ui_table_row(nbuf, db->categories[i].name, ibuf, num_w, name_w, info_w);
+            row++;
+            snprintf(nbuf, sizeof(nbuf), "%d", row);
+            snprintf(ibuf, sizeof(ibuf), "%d item(s), %d field(s)",
+                     count_items_in_category(cid), field_count(cid));
+            ui_table_row(nbuf, cname, ibuf, num_w, name_w, info_w);
         }
+        sqlite3_finalize(st);
     }
 
+    if (row == 0) {
+        ui_table_row("-", "No categories yet", "Create one first", num_w, name_w, info_w);
+    }
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
 }
 
-static void rename_category(Database *db, int ci) {
+static void rename_category(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
     char newname[MAX_NAME];
-    char oldname[MAX_NAME];
-    int i;
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-
-    ui_header("Rename category", db->categories[ci].name);
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("Rename category", cat);
 
     if (!read_required_line("New name:", newname, sizeof(newname))) return;
 
-    if (strings_equal_ci(newname, db->categories[ci].name)) {
+    if (strings_equal_ci(newname, cat)) {
         print_indent(get_layout().left);
         printf("%s" "The name did not change.\n" "%s", COLOR_DIM, COLOR_RESET);
         pause_enter();
         return;
     }
-
-    if (find_category(db, newname) >= 0) {
+    if (category_exists(newname)) {
         print_indent(get_layout().left);
         printf("%s" "A category with this name already exists.\n" "%s", COLOR_YELLOW, COLOR_RESET);
         pause_enter();
         return;
     }
 
-    safe_copy(oldname, sizeof(oldname), db->categories[ci].name);
-    safe_copy(db->categories[ci].name, sizeof(db->categories[ci].name), newname);
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (db->items[i].used && strings_equal_ci(db->items[i].category, oldname)) {
-            safe_copy(db->items[i].category, sizeof(db->items[i].category), newname);
-        }
+    if (sqlite3_prepare_v2(g_db, "UPDATE categories SET name=? WHERE id=?;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, newname, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, cat_id);
+        if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+        sqlite3_finalize(st);
     }
 
-    db->dirty = 1;
-    if (save_database(db)) {
-        print_indent(get_layout().left);
-        printf("%s" "Category renamed.\n" "%s", COLOR_GREEN, COLOR_RESET);
-    }
+    print_indent(get_layout().left);
+    if (ok) printf("%s" "Category renamed.\n" "%s", COLOR_GREEN, COLOR_RESET);
+    else printf("%s" "Could not rename.\n" "%s", COLOR_RED, COLOR_RESET);
     pause_enter();
 }
 
-static void delete_category(Database *db, int ci) {
-    char question[180];
-    char catname[MAX_NAME];
-    int i;
+static void delete_category_ui(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
+    char question[200];
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-
-    ui_header("Delete category", db->categories[ci].name);
-
-    snprintf(question,
-             sizeof(question),
-             "Delete category '%s' and all its items?",
-             db->categories[ci].name);
+    category_name(cat_id, cat, sizeof(cat));
+    ui_header("Delete category", cat);
+    snprintf(question, sizeof(question),
+             "Delete category '%s' and all its items?", cat);
 
     if (!confirm_action(question)) {
         print_indent(get_layout().left);
@@ -1945,43 +1842,27 @@ static void delete_category(Database *db, int ci) {
         return;
     }
 
-    safe_copy(catname, sizeof(catname), db->categories[ci].name);
-
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (db->items[i].used && strings_equal_ci(db->items[i].category, catname)) {
-            delete_item_slot(db, i);
-        }
-    }
-
-    for (i = ci; i < db->category_count - 1; i++) {
-        db->categories[i] = db->categories[i + 1];
-    }
-
-    if (db->category_count > 0) {
-        memset(&db->categories[db->category_count - 1], 0, sizeof(db->categories[0]));
-        db->category_count--;
-    }
-
-    db->dirty = 1;
-    if (save_database(db)) {
+    if (category_delete(cat_id)) {
         print_indent(get_layout().left);
         printf("%s" "Category deleted.\n" "%s", COLOR_GREEN, COLOR_RESET);
     }
     pause_enter();
 }
 
-static void manage_fields(Database *db, int ci) {
-    int choice;
-    Category *cat;
+static void manage_fields(sqlite3_int64 cat_id) {
+    char cat[MAX_NAME];
 
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-    cat = &db->categories[ci];
+    category_name(cat_id, cat, sizeof(cat));
 
     for (;;) {
+        char names[MAX_FIELDS][MAX_NAME];
+        sqlite3_int64 ids[MAX_FIELDS];
+        int nf;
         int i;
         int n_w;
         int field_w;
         int note_w;
+        int choice;
         Layout lay;
         const char *items[][2] = {
             {"Add field", "Create a new custom column"},
@@ -1991,8 +1872,9 @@ static void manage_fields(Database *db, int ci) {
         };
         const int nums[] = {1, 2, 3, 0};
 
-        ui_header("Manage fields", cat->name);
+        nf = field_load(cat_id, names, ids, MAX_FIELDS);
 
+        ui_header("Manage fields", cat);
         lay = get_layout();
         n_w = 5;
         field_w = (int)((double)lay.inner * INV_PHI) - 4;
@@ -2003,17 +1885,15 @@ static void manage_fields(Database *db, int ci) {
         ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
         ui_table_header("NO", "FIELD", "STATUS", n_w, field_w, note_w);
         ui_rule(lay, '+', UI_HORIZONTAL, '+');
-
-        if (cat->field_count == 0) {
+        if (nf == 0) {
             ui_table_row("-", "No fields", "Add one first", n_w, field_w, note_w);
         } else {
-            for (i = 0; i < cat->field_count; i++) {
+            for (i = 0; i < nf; i++) {
                 char num[16];
                 snprintf(num, sizeof(num), "%d", i + 1);
-                ui_table_row(num, cat->fields[i].name, "active", n_w, field_w, note_w);
+                ui_table_row(num, names[i], "active", n_w, field_w, note_w);
             }
         }
-
         ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
         putchar('\n');
         ui_menu_box("Field Actions", "Schema editor", items, nums, 4);
@@ -2023,21 +1903,18 @@ static void manage_fields(Database *db, int ci) {
 
         if (choice == 1) {
             char field[MAX_NAME];
-            int r;
-
-            if (cat->field_count >= MAX_FIELDS) {
+            if (nf >= MAX_FIELDS) {
                 print_indent(get_layout().left);
                 printf("%s" "Field limit reached.\n" "%s", COLOR_YELLOW, COLOR_RESET);
                 pause_enter();
                 continue;
             }
-
             if (read_required_line("New field:", field, sizeof(field))) {
-                r = add_field_internal(db, ci, field);
+                int r = field_add(cat_id, field);
                 if (r == -2) {
                     print_indent(get_layout().left);
                     printf("%s" "This field already exists.\n" "%s", COLOR_YELLOW, COLOR_RESET);
-                } else if (r >= 0 && save_database(db)) {
+                } else if (r == 1) {
                     print_indent(get_layout().left);
                     printf("%s" "Field added.\n" "%s", COLOR_GREEN, COLOR_RESET);
                 }
@@ -2046,79 +1923,56 @@ static void manage_fields(Database *db, int ci) {
         } else if (choice == 2) {
             int fi;
             char field[MAX_NAME];
-
-            if (cat->field_count == 0) {
+            if (nf == 0) {
                 print_indent(get_layout().left);
                 printf("%s" "No fields to rename.\n" "%s", COLOR_YELLOW, COLOR_RESET);
                 pause_enter();
                 continue;
             }
-
-            fi = read_int_range("Field number:", 1, cat->field_count);
+            fi = read_int_range("Field number:", 1, nf);
             if (fi == INPUT_CANCEL) continue;
             fi = fi - 1;
             if (read_required_line("New field:", field, sizeof(field))) {
-                if (strings_equal_ci(field, cat->fields[fi].name)) {
-                    print_indent(get_layout().left);
-                    printf("%s" "The name did not change.\n" "%s", COLOR_DIM, COLOR_RESET);
-                } else if (find_field(cat, field) >= 0) {
-                    print_indent(get_layout().left);
-                    printf("%s" "This field already exists.\n" "%s", COLOR_YELLOW, COLOR_RESET);
-                } else {
-                    safe_copy(cat->fields[fi].name, sizeof(cat->fields[fi].name), field);
-                    db->dirty = 1;
-                    if (save_database(db)) {
-                        print_indent(get_layout().left);
-                        printf("%s" "Field renamed.\n" "%s", COLOR_GREEN, COLOR_RESET);
-                    }
+                sqlite3_stmt *st = NULL;
+                int ok = 0;
+                if (sqlite3_prepare_v2(g_db, "UPDATE fields SET name=? WHERE id=?;",
+                                       -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(st, 1, field, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(st, 2, ids[fi]);
+                    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+                    sqlite3_finalize(st);
                 }
+                print_indent(get_layout().left);
+                if (ok) printf("%s" "Field renamed.\n" "%s", COLOR_GREEN, COLOR_RESET);
+                else printf("%s" "Could not rename.\n" "%s", COLOR_RED, COLOR_RESET);
                 pause_enter();
             }
         } else if (choice == 3) {
             int fi;
-            char question[180];
-
-            if (cat->field_count == 0) {
+            char question[200];
+            if (nf == 0) {
                 print_indent(get_layout().left);
                 printf("%s" "No fields to delete.\n" "%s", COLOR_YELLOW, COLOR_RESET);
                 pause_enter();
                 continue;
             }
-
-            fi = read_int_range("Field number:", 1, cat->field_count);
+            fi = read_int_range("Field number:", 1, nf);
             if (fi == INPUT_CANCEL) continue;
             fi = fi - 1;
-            snprintf(question,
-                     sizeof(question),
-                     "Delete field '%s' and all its values?",
-                     cat->fields[fi].name);
-
+            snprintf(question, sizeof(question),
+                     "Delete field '%s' and all its values?", names[fi]);
             if (confirm_action(question)) {
-                int item;
-                int v;
-
-                for (i = fi; i < cat->field_count - 1; i++) {
-                    cat->fields[i] = cat->fields[i + 1];
+                sqlite3_stmt *st = NULL;
+                int ok = 0;
+                if (sqlite3_prepare_v2(g_db, "DELETE FROM fields WHERE id=?;",
+                                       -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(st, 1, ids[fi]);
+                    if (sqlite3_step(st) == SQLITE_DONE) ok = 1;
+                    sqlite3_finalize(st);
                 }
-                memset(&cat->fields[cat->field_count - 1], 0, sizeof(cat->fields[0]));
-
-                for (item = 0; item < MAX_ITEMS; item++) {
-                    if (db->items[item].used && strings_equal_ci(db->items[item].category, cat->name)) {
-                        for (v = fi; v < MAX_FIELDS - 1; v++) {
-                            safe_copy(db->items[item].values[v],
-                                      sizeof(db->items[item].values[v]),
-                                      db->items[item].values[v + 1]);
-                        }
-                        db->items[item].values[MAX_FIELDS - 1][0] = '\0';
-                    }
-                }
-
-                cat->field_count--;
-                db->dirty = 1;
-                if (save_database(db)) {
-                    print_indent(get_layout().left);
-                    printf("%s" "Field deleted.\n" "%s", COLOR_GREEN, COLOR_RESET);
-                }
+                print_indent(get_layout().left);
+                if (ok) printf("%s" "Field deleted.\n" "%s", COLOR_GREEN, COLOR_RESET);
+                else printf("%s" "Could not delete.\n" "%s", COLOR_RED, COLOR_RESET);
             } else {
                 print_indent(get_layout().left);
                 printf("%s" "Canceled.\n" "%s", COLOR_DIM, COLOR_RESET);
@@ -2128,13 +1982,11 @@ static void manage_fields(Database *db, int ci) {
     }
 }
 
-static void category_menu(Database *db, int ci) {
-    int choice;
-
-    if (db == NULL || ci < 0 || ci >= db->category_count) return;
-
+static void category_menu(sqlite3_int64 cat_id) {
     for (;;) {
+        char cat[MAX_NAME];
         char subtitle[160];
+        int choice;
         const char *items[][2] = {
             {"List items", "View everything in this category"},
             {"Add item", "Register a new catalog entry"},
@@ -2148,71 +2000,63 @@ static void category_menu(Database *db, int ci) {
         };
         const int nums[] = {1, 2, 3, 4, 5, 6, 7, 8, 0};
 
-        if (ci >= db->category_count) return;
+        if (!category_name(cat_id, cat, sizeof(cat))) return;  /* gone (deleted) */
 
-        snprintf(subtitle,
-                 sizeof(subtitle),
-                 "%d item(s), %d field(s)",
-                 count_items_in_category(db, db->categories[ci].name),
-                 db->categories[ci].field_count);
+        snprintf(subtitle, sizeof(subtitle), "%d item(s), %d field(s)",
+                 count_items_in_category(cat_id), field_count(cat_id));
 
-        ui_header(db->categories[ci].name, subtitle);
+        ui_header(cat, subtitle);
         ui_menu_box("Category Menu", "Choose an action  -  ESC = back", items, nums, 9);
 
         choice = read_int_range("Choice:", 0, 8);
         if (choice == 0 || choice == INPUT_CANCEL) return;
-        if (choice == 1) list_items_in_category(db, ci);
-        else if (choice == 2) add_item(db, ci);
-        else if (choice == 3) search_items(db, ci);
-        else if (choice == 4) edit_item(db, ci);
-        else if (choice == 5) delete_item(db, ci);
-        else if (choice == 6) manage_fields(db, ci);
-        else if (choice == 7) rename_category(db, ci);
-        else if (choice == 8) {
-            delete_category(db, ci);
-            return;
-        }
+        if (choice == 1) list_items_in_category(cat_id);
+        else if (choice == 2) add_item(cat_id);
+        else if (choice == 3) search_items(cat_id);
+        else if (choice == 4) edit_item(cat_id);
+        else if (choice == 5) delete_item_ui(cat_id);
+        else if (choice == 6) manage_fields(cat_id);
+        else if (choice == 7) rename_category(cat_id);
+        else if (choice == 8) { delete_category_ui(cat_id); return; }
     }
 }
 
-static void open_category(Database *db) {
+static void open_category(void) {
+    int total;
     int choice;
 
-    if (db == NULL) return;
-
     ui_header("Categories", "Choose a number to open a category");
-    list_categories_table(db);
+    list_categories_table();
 
-    if (db->category_count == 0) {
-        pause_enter();
-        return;
+    total = total_categories();
+    if (total == 0) { pause_enter(); return; }
+
+    choice = read_int_range("Open number, or 0:", 0, total);
+    if (choice != INPUT_CANCEL && choice > 0) {
+        sqlite3_int64 cid = category_id_at(choice - 1);
+        if (cid != 0) category_menu(cid);
     }
-
-    choice = read_int_range("Open number, or 0:", 0, db->category_count);
-    if (choice != INPUT_CANCEL && choice > 0) category_menu(db, choice - 1);
 }
 
-static void show_stats(Database *db) {
-    int i;
+static void show_stats(void) {
+    sqlite3_stmt *st = NULL;
     int name_w;
     int info_w;
+    int rows = 0;
     Layout lay;
-    char total_categories[32];
-    char total_items[32];
-
-    if (db == NULL) return;
+    char tc[32];
+    char ti[32];
 
     ui_header("Statistics", "Database overview");
-
     lay = get_layout();
-    snprintf(total_categories, sizeof(total_categories), "%d", db->category_count);
-    snprintf(total_items, sizeof(total_items), "%d", db->item_count);
+    snprintf(tc, sizeof(tc), "%d", total_categories());
+    snprintf(ti, sizeof(ti), "%d", total_items());
 
     ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
     ui_center_line(lay, "Vault Summary", COLOR_GREEN);
-    ui_key_value("Total categories", total_categories);
-    ui_key_value("Total items", total_items);
-    ui_key_value("CSV file", DB_FILE);
+    ui_key_value("Total categories", tc);
+    ui_key_value("Total items", ti);
+    ui_key_value("Database file", DB_FILE);
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     putchar('\n');
 
@@ -2226,74 +2070,65 @@ static void show_stats(Database *db) {
     ui_table_header("CATEGORY", "ITEMS / FIELDS", "", name_w, info_w, 0);
     ui_rule(lay, '+', UI_HORIZONTAL, '+');
 
-    if (db->category_count == 0) {
-        ui_table_row("No categories", "Create one first", "", name_w, info_w, 0);
-    } else {
-        for (i = 0; i < db->category_count; i++) {
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, name FROM categories ORDER BY position, id;",
+            -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            sqlite3_int64 cid = sqlite3_column_int64(st, 0);
+            const char *cname = (const char *)sqlite3_column_text(st, 1);
             char info[80];
-            snprintf(info,
-                     sizeof(info),
-                     "%d item(s), %d field(s)",
-                     count_items_in_category(db, db->categories[i].name),
-                     db->categories[i].field_count);
-            ui_table_row(db->categories[i].name, info, "", name_w, info_w, 0);
+            rows++;
+            snprintf(info, sizeof(info), "%d item(s), %d field(s)",
+                     count_items_in_category(cid), field_count(cid));
+            ui_table_row(cname, info, "", name_w, info_w, 0);
         }
+        sqlite3_finalize(st);
     }
-
+    if (rows == 0) {
+        ui_table_row("No categories", "Create one first", "", name_w, info_w, 0);
+    }
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     pause_enter();
 }
 
 static void show_help(void) {
     Layout lay;
-
     ui_header("Help", "Simple, safe and universal");
     lay = get_layout();
-
     ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
     ui_center_line(lay, "How AureaVault works", COLOR_GREEN);
     ui_blank_line(lay);
     ui_line(lay, "1. Create a category for anything: movies, books, places, goals or tools.", NULL);
     ui_line(lay, "2. Define custom fields: Title, Date, Rating, Notes, Price, Status, etc.", NULL);
     ui_line(lay, "3. Add items and search across every field, including field names.", NULL);
-    ui_line(lay, "4. Everything is saved in one normalized CSV file.", NULL);
+    ui_line(lay, "4. Everything is stored in a SQLite database that scales to millions.", NULL);
     ui_blank_line(lay);
-    ui_line(lay, "The program saves through a temporary file, then replaces the database safely.", COLOR_DIM);
+    ui_line(lay, "Every change is an ACID transaction, so your data is safe even on power loss.", COLOR_DIM);
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
-
     pause_enter();
 }
 
-static void create_demo_if_empty(Database *db) {
-    if (db == NULL || db->category_count != 0) return;
-
-    if (confirm_action("No database found. Create a small demo category?")) {
-        int ci;
-        ci = add_category_internal(db, "Movies");
-        if (ci >= 0) {
-            (void)add_field_internal(db, ci, "Title");
-            (void)add_field_internal(db, ci, "Date");
-            (void)add_field_internal(db, ci, "Rating");
-            (void)add_field_internal(db, ci, "Notes");
-            (void)save_database(db);
+static void create_demo_if_empty(void) {
+    if (total_categories() != 0) return;
+    if (confirm_action("No data yet. Create a small demo category?")) {
+        sqlite3_int64 cid = category_create("Movies");
+        if (cid != 0) {
+            field_add(cid, "Title");
+            field_add(cid, "Date");
+            field_add(cid, "Rating");
+            field_add(cid, "Notes");
         }
     }
 }
 
-static void export_text_report(Database *db) {
+static void export_text_report(void) {
     static const char *REPORT_FILE = "aureavault_report.txt";
     static const char *REPORT_TEMP = "aureavault_report.txt.tmp";
     FILE *fp;
-    int c;
-    int f;
-
-    if (db == NULL) return;
+    sqlite3_stmt *cst = NULL;
 
     ui_header("Text Report", "Export a printer-friendly summary of your vault.");
 
-    /* Write to a temporary file first, then rename. If anything fails, the
-       previous report (if any) stays untouched. This is the same safe pattern
-       the database uses. */
     fp = fopen(REPORT_TEMP, "w");
     if (fp == NULL) {
         print_indent(get_layout().left);
@@ -2309,44 +2144,52 @@ static void export_text_report(Database *db) {
         fprintf(fp, "%s\n", APP_TAGLINE);
         fprintf(fp, "Generated: %s\n", stamp[0] != '\0' ? stamp : "unknown");
         fprintf(fp, "============================================================\n");
-        fprintf(fp, "Categories: %d    Items: %d\n", db->category_count, db->item_count);
+        fprintf(fp, "Categories: %d    Items: %d\n", total_categories(), total_items());
         fprintf(fp, "============================================================\n\n");
     }
 
-    for (c = 0; c < db->category_count; c++) {
-        const Category *cat = &db->categories[c];
-        int shown = 0;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, name FROM categories ORDER BY position, id;",
+            -1, &cst, NULL) == SQLITE_OK) {
+        while (sqlite3_step(cst) == SQLITE_ROW) {
+            sqlite3_int64 cid = sqlite3_column_int64(cst, 0);
+            const char *cname = (const char *)sqlite3_column_text(cst, 1);
+            char names[MAX_FIELDS][MAX_NAME];
+            sqlite3_int64 ids[MAX_FIELDS];
+            int nf = field_load(cid, names, ids, MAX_FIELDS);
+            sqlite3_stmt *ist = NULL;
+            int shown = 0;
 
-        fprintf(fp, "## %s\n", cat->name);
-        fprintf(fp, "------------------------------------------------------------\n");
+            fprintf(fp, "## %s\n", cname);
+            fprintf(fp, "------------------------------------------------------------\n");
 
-        {
-            int order[MAX_ITEMS];
-            int n;
-            int k;
-
-            n = collect_sorted_slots(db, cat->name, order, MAX_ITEMS);
-            for (k = 0; k < n; k++) {
-                const Item *it = &db->items[order[k]];
-
-                shown++;
-                fprintf(fp, "Item #%d\n", it->id);
-                if (it->created[0] != '\0') {
-                    fprintf(fp, "  Created: %s\n", it->created);
+            if (sqlite3_prepare_v2(g_db,
+                    "SELECT id, seq, created FROM items WHERE category_id=? ORDER BY seq;",
+                    -1, &ist, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(ist, 1, cid);
+                while (sqlite3_step(ist) == SQLITE_ROW) {
+                    sqlite3_int64 item_id = sqlite3_column_int64(ist, 0);
+                    int seq = sqlite3_column_int(ist, 1);
+                    const char *created = (const char *)sqlite3_column_text(ist, 2);
+                    int f;
+                    shown++;
+                    fprintf(fp, "Item #%d\n", seq);
+                    if (created != NULL && created[0] != '\0')
+                        fprintf(fp, "  Created: %s\n", created);
+                    for (f = 0; f < nf; f++) {
+                        char value[MAX_VALUE];
+                        item_value(item_id, ids[f], value, sizeof(value));
+                        fprintf(fp, "  %s: %s\n", names[f], value);
+                    }
+                    fprintf(fp, "\n");
                 }
-                for (f = 0; f < cat->field_count; f++) {
-                    fprintf(fp, "  %s: %s\n", cat->fields[f].name, it->values[f]);
-                }
-                fprintf(fp, "\n");
+                sqlite3_finalize(ist);
             }
+            if (shown == 0) fprintf(fp, "(no items)\n\n");
         }
-
-        if (shown == 0) {
-            fprintf(fp, "(no items)\n\n");
-        }
+        sqlite3_finalize(cst);
     }
 
-    /* Make sure every byte reaches the disk before we replace the old file. */
     if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
         fclose(fp);
         print_indent(get_layout().left);
@@ -2375,15 +2218,14 @@ static void export_text_report(Database *db) {
     pause_enter();
 }
 
-static void main_menu(Database *db) {
-    int choice;
-
-    if (db == NULL) return;
-
+static void main_menu(void) {
     for (;;) {
-        char subtitle[180];
+        char subtitle[200];
         char left[160];
         char right[160];
+        int choice;
+        int cats = total_categories();
+        int its = total_items();
         const char *items[][2] = {
             {"Open categories", "Browse, view and edit items"},
             {"Create category", "Build a new custom catalog"},
@@ -2395,14 +2237,10 @@ static void main_menu(Database *db) {
         };
         const int nums[] = {1, 2, 3, 4, 5, 6, 0};
 
-        snprintf(subtitle,
-                 sizeof(subtitle),
-                 "%d categories | %d items | %s",
-                 db->category_count,
-                 db->item_count,
-                 DB_FILE);
-        snprintf(left, sizeof(left), "Categories: %d", db->category_count);
-        snprintf(right, sizeof(right), "Items: %d", db->item_count);
+        snprintf(subtitle, sizeof(subtitle), "%d categories | %d items | %s",
+                 cats, its, DB_FILE);
+        snprintf(left, sizeof(left), "Categories: %d", cats);
+        snprintf(right, sizeof(right), "Items: %d", its);
 
         ui_header(APP_TAGLINE, subtitle);
         ui_status_box("Vault Status", left, right);
@@ -2412,28 +2250,20 @@ static void main_menu(Database *db) {
         choice = read_int_range("Choice:", 0, 6);
 
         if (choice == INPUT_CANCEL) {
-            /* At the top menu there is nowhere to go back to. A lone ESC just
-               redraws the menu; an ended input (Ctrl+D) exits safely. */
-            if (g_input_canceled) {
-                g_input_canceled = 0;
-                continue;
-            }
-            if (db->dirty) (void)save_database(db);
+            if (g_input_canceled) { g_input_canceled = 0; continue; }
             ui_header("Goodbye", "Your life catalog is safe.");
             return;
         }
-
         if (choice == 0) {
-            if (db->dirty) (void)save_database(db);
             ui_header("Goodbye", "Your life catalog is safe.");
             return;
         }
-        if (choice == 1) open_category(db);
-        else if (choice == 2) add_category_ui(db);
-        else if (choice == 3) search_items(db, -1);
-        else if (choice == 4) show_stats(db);
+        if (choice == 1) open_category();
+        else if (choice == 2) add_category_ui();
+        else if (choice == 3) search_items(0);
+        else if (choice == 4) show_stats();
         else if (choice == 5) show_help();
-        else if (choice == 6) export_text_report(db);
+        else if (choice == 6) export_text_report();
     }
 }
 
@@ -2445,7 +2275,7 @@ static void choose_color_mode(void) {
 
     for (;;) {
         lay = get_layout();
-        clear_screen();         /* start on a clean screen, like every other menu */
+        clear_screen();
 
         putchar('\n');
         ui_rule(lay, UI_TOP_LEFT, UI_HORIZONTAL, UI_TOP_RIGHT);
@@ -2470,7 +2300,7 @@ static void choose_color_mode(void) {
         fflush(stdout);
 
         if (!read_line_raw(line, sizeof(line))) {
-            g_color = 1;            /* default to colors if input ends (Ctrl+D) */
+            g_color = 1;
             return;
         }
         trim_in_place(line);
@@ -2479,26 +2309,24 @@ static void choose_color_mode(void) {
             g_color = (value == 0) ? 1 : 0;
             return;
         }
-
         invalid = 1;
     }
 }
 
 int main(void) {
-    int loaded;
-
     choose_color_mode();
 
-    loaded = load_database(&g_db);
-    if (g_load_truncated) {
-        ui_header(APP_TAGLINE,
-                  "WARNING: file too large - opened READ-ONLY, saving is blocked.");
-    } else {
-        ui_header(APP_TAGLINE, loaded ? "Database loaded." : "New database.");
+    if (!db_open()) {
+        db_close();
+        print_indent(get_layout().left);
+        printf("%s" "Could not open the database. Exiting.\n" "%s", COLOR_RED, COLOR_RESET);
+        return 1;
     }
 
-    if (!loaded) create_demo_if_empty(&g_db);
-    main_menu(&g_db);
+    ui_header(APP_TAGLINE, "Database ready.");
+    create_demo_if_empty();
+    main_menu();
 
+    db_close();
     return 0;
 }
