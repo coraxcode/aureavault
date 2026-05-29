@@ -331,8 +331,18 @@ static void crop_text(const char *src, char *dst, size_t dst_size, int width) {
         return;
     }
 
+    /* Need room for the text plus "..." plus the terminating NUL. If the buffer
+       is too small to hold even "...\0", fall back to a plain truncation so we
+       never write past the end of dst. */
+    if (dst_size < 5) {
+        copy_len = dst_size - 1;
+        memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+        return;
+    }
+
     copy_len = (size_t)(width - 3);
-    if (copy_len + 3 >= dst_size) copy_len = dst_size > 4 ? dst_size - 4 : 0;
+    if (copy_len + 4 > dst_size) copy_len = dst_size - 4;
     memcpy(dst, src, copy_len);
     dst[copy_len] = '.';
     dst[copy_len + 1] = '.';
