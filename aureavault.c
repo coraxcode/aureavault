@@ -931,6 +931,62 @@ static int count_items_in_category(const Database *db, const char *category) {
     return count;
 }
 
+/* Fills "out" with the slot indices of every item in "category", ordered by the
+   item's current ID (ascending). Returns how many slots were written. */
+static int collect_sorted_slots(const Database *db, const char *category,
+                                int *out, int out_max) {
+    int i;
+    int j;
+    int n = 0;
+
+    if (db == NULL || category == NULL || out == NULL) return 0;
+
+    for (i = 0; i < MAX_ITEMS && n < out_max; i++) {
+        if (db->items[i].used && strings_equal_ci(db->items[i].category, category)) {
+            out[n++] = i;
+        }
+    }
+
+    /* Insertion sort by current ID: small, stable and safe for our sizes. */
+    for (i = 1; i < n; i++) {
+        int key = out[i];
+        int key_id = db->items[key].id;
+        j = i - 1;
+        while (j >= 0 && db->items[out[j]].id > key_id) {
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = key;
+    }
+
+    return n;
+}
+
+/* Reassigns sequential IDs 1..N to the items of a category, keeping their order,
+   so the list never shows gaps after a deletion. */
+static void renumber_category(Database *db, const char *category) {
+    int order[MAX_ITEMS];
+    int n;
+    int i;
+
+    if (db == NULL || category == NULL) return;
+
+    n = collect_sorted_slots(db, category, order, MAX_ITEMS);
+    for (i = 0; i < n; i++) {
+        db->items[order[i]].id = i + 1;
+    }
+}
+
+/* Renumbers every category. Used right after loading so old files with gaps
+   (or items added across categories) always start clean and sequential. */
+static void renumber_all(Database *db) {
+    int c;
+    if (db == NULL) return;
+    for (c = 0; c < db->category_count; c++) {
+        renumber_category(db, db->categories[c].name);
+    }
+}
+
 static int find_item_slot_by_id(const Database *db, const char *category, int id) {
     int i;
 
@@ -1153,6 +1209,7 @@ static int load_database(Database *db) {
     }
 
     fclose(fp);
+    renumber_all(db);       /* guarantee clean 1..N IDs per category on open */
     db->dirty = 0;
     return 1;
 }
@@ -1419,15 +1476,22 @@ static void list_items_in_category(Database *db, int ci) {
 
     ui_items_table_begin(&id_w, &category_w, &preview_w);
 
-    for (i = 0; i < MAX_ITEMS; i++) {
-        if (!db->items[i].used || !strings_equal_ci(db->items[i].category, cat->name)) continue;
-        print_item_table_row(db, i, id_w, category_w, preview_w);
-        shown++;
-        if (shown % PAGE_LINES == 0) {
-            ui_items_table_end();
-            pause_enter();
-            ui_header("List items", cat->name);
-            ui_items_table_begin(&id_w, &category_w, &preview_w);
+    {
+        int order[MAX_ITEMS];
+        int n;
+        int k;
+
+        n = collect_sorted_slots(db, cat->name, order, MAX_ITEMS);
+        for (k = 0; k < n; k++) {
+            i = order[k];
+            print_item_table_row(db, i, id_w, category_w, preview_w);
+            shown++;
+            if (shown % PAGE_LINES == 0) {
+                ui_items_table_end();
+                pause_enter();
+                ui_header("List items", cat->name);
+                ui_items_table_begin(&id_w, &category_w, &preview_w);
+            }
         }
     }
 
@@ -1488,7 +1552,8 @@ static void add_item(Database *db, int ci) {
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
     putchar('\n');
 
-    id = db->next_id;
+    /* Sequential per-category ID. Items stay numbered 1..N with no gaps. */
+    id = count_items_in_category(db, cat->name) + 1;
     slot = allocate_item(db, cat->name, id);
     if (slot < 0) {
         ui_message_box("Could not allocate item.", COLOR_RED);
@@ -1607,6 +1672,7 @@ static void delete_item(Database *db, int ci) {
     snprintf(question, sizeof(question), "Delete item ID %d permanently?", id);
     if (confirm_action(question)) {
         delete_item_slot(db, slot);
+        renumber_category(db, cat->name);   /* close the gap: 1,2,3,... again */
         if (save_database(db)) {
             print_indent(get_layout().left);
             printf("%s" "Item deleted.\n" "%s", COLOR_GREEN, COLOR_RESET);
@@ -2210,7 +2276,6 @@ static void export_text_report(Database *db) {
     FILE *fp;
     int c;
     int f;
-    int i;
 
     if (db == NULL) return;
 
@@ -2245,20 +2310,25 @@ static void export_text_report(Database *db) {
         fprintf(fp, "## %s\n", cat->name);
         fprintf(fp, "------------------------------------------------------------\n");
 
-        for (i = 0; i < MAX_ITEMS; i++) {
-            const Item *it = &db->items[i];
-            if (!it->used) continue;
-            if (!strings_equal_ci(it->category, cat->name)) continue;
+        {
+            int order[MAX_ITEMS];
+            int n;
+            int k;
 
-            shown++;
-            fprintf(fp, "Item #%d\n", it->id);
-            if (it->created[0] != '\0') {
-                fprintf(fp, "  Created: %s\n", it->created);
+            n = collect_sorted_slots(db, cat->name, order, MAX_ITEMS);
+            for (k = 0; k < n; k++) {
+                const Item *it = &db->items[order[k]];
+
+                shown++;
+                fprintf(fp, "Item #%d\n", it->id);
+                if (it->created[0] != '\0') {
+                    fprintf(fp, "  Created: %s\n", it->created);
+                }
+                for (f = 0; f < cat->field_count; f++) {
+                    fprintf(fp, "  %s: %s\n", cat->fields[f].name, it->values[f]);
+                }
+                fprintf(fp, "\n");
             }
-            for (f = 0; f < cat->field_count; f++) {
-                fprintf(fp, "  %s: %s\n", cat->fields[f].name, it->values[f]);
-            }
-            fprintf(fp, "\n");
         }
 
         if (shown == 0) {
