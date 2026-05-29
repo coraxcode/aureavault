@@ -30,8 +30,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 
 #define APP_NAME        "AureaVault"
 #define APP_TAGLINE     "A golden-ratio life catalog for everything you keep."
@@ -90,6 +92,7 @@ typedef struct {
     int used;
     int id;
     char category[MAX_NAME];
+    char created[32];                 /* ISO 8601 timestamp, e.g. 2026-05-29T20:17:08 */
     char values[MAX_FIELDS][MAX_VALUE];
 } Item;
 
@@ -115,6 +118,7 @@ typedef struct {
 static Database g_db;
 static int g_color = 1;   /* 1 = colors on, 0 = plain text (no escapes) */
 static int g_load_truncated = 0; /* set if the file held more data than fits in memory */
+static int g_input_canceled = 0; /* set when the user presses ESC to cancel/go back */
 
 static void clear_screen(void);
 static int terminal_is_ansi(void);
@@ -138,6 +142,25 @@ static int safe_copy(char *dst, size_t dst_size, const char *src) {
     dst[n] = '\0';
 
     return src[n] == '\0';
+}
+
+static void iso8601_now(char *out, size_t out_size) {
+    time_t now;
+    struct tm tmv;
+
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+
+    now = time(NULL);
+    if (now == (time_t)-1) return;
+
+    /* localtime_r is reentrant and safe; fall back gracefully if it fails. */
+    if (localtime_r(&now, &tmv) == NULL) return;
+
+    /* strftime writes the standard ISO 8601 date and time: YYYY-MM-DDTHH:MM:SS */
+    if (strftime(out, out_size, "%Y-%m-%dT%H:%M:%S", &tmv) == 0) {
+        out[0] = '\0';
+    }
 }
 
 static void trim_in_place(char *s) {
@@ -605,10 +628,8 @@ static void ui_message_box(const char *message, const char *color) {
     ui_rule(lay, UI_BOTTOM_LEFT, UI_HORIZONTAL, UI_BOTTOM_RIGHT);
 }
 
-static int read_line_raw(char *buffer, size_t buffer_size) {
+static int read_line_fallback(char *buffer, size_t buffer_size) {
     size_t len;
-
-    if (buffer == NULL || buffer_size == 0) return 0;
 
     if (fgets(buffer, buffer_size, stdin) == NULL) {
         buffer[0] = '\0';
@@ -625,6 +646,105 @@ static int read_line_raw(char *buffer, size_t buffer_size) {
     }
 
     return 1;
+}
+
+/* Reads one line from the user. On an interactive terminal it reads key by key
+   so the ESC key can cancel immediately: ESC sets g_input_canceled and returns 0.
+   Arrow keys (ESC [ ...) are detected and ignored, so they never cancel.
+   When input is not a terminal (a pipe or a file), it falls back to a simple
+   and reliable line reader, keeping scripts and automated use working. */
+static int read_line_raw(char *buffer, size_t buffer_size) {
+    struct termios oldt;
+    struct termios rawt;
+    size_t len = 0;
+
+    if (buffer == NULL || buffer_size == 0) return 0;
+    buffer[0] = '\0';
+    g_input_canceled = 0;
+
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        return read_line_fallback(buffer, buffer_size);
+    }
+
+    rawt = oldt;
+    rawt.c_lflag = (tcflag_t)(rawt.c_lflag & ~(ICANON | ECHO));
+    rawt.c_cc[VMIN] = 1;
+    rawt.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &rawt) != 0) {
+        return read_line_fallback(buffer, buffer_size);
+    }
+
+    for (;;) {
+        unsigned char c;
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+
+        if (r <= 0) {                       /* end of input or read error */
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            putchar('\n');                     /* end the prompt line cleanly */
+            fflush(stdout);
+            buffer[len] = '\0';
+            return len > 0 ? 1 : 0;
+        }
+
+        if (c == 27) {                      /* ESC: maybe a lone key, maybe a sequence */
+            struct termios peekt = rawt;
+            unsigned char seq;
+            ssize_t r2;
+
+            peekt.c_cc[VMIN] = 0;
+            peekt.c_cc[VTIME] = 1;          /* wait up to 0.1s for more bytes */
+            tcsetattr(STDIN_FILENO, TCSANOW, &peekt);
+            r2 = read(STDIN_FILENO, &seq, 1);
+
+            if (r2 > 0) {                   /* it is a sequence (e.g. an arrow key) */
+                if (seq == '[' || seq == 'O') {
+                    unsigned char t;
+                    while (read(STDIN_FILENO, &t, 1) == 1) {
+                        if ((t >= 'A' && t <= 'Z') || (t >= 'a' && t <= 'z') || t == '~') break;
+                    }
+                }
+                tcsetattr(STDIN_FILENO, TCSANOW, &rawt);
+                continue;                   /* ignore the sequence, keep typing */
+            }
+
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);   /* lone ESC: cancel */
+            putchar('\n');                            /* end the prompt line cleanly */
+            fflush(stdout);
+            buffer[0] = '\0';
+            g_input_canceled = 1;
+            return 0;
+        }
+
+        if (c == '\n' || c == '\r') {       /* ENTER: finish the line */
+            putchar('\n');
+            fflush(stdout);
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            buffer[len] = '\0';
+            return 1;
+        }
+
+        if (c == 127 || c == 8) {           /* BACKSPACE (also erases full UTF-8 chars) */
+            if (len > 0) {
+                do {
+                    len--;
+                } while (len > 0 &&
+                         (unsigned char)buffer[len] >= 0x80 &&
+                         (unsigned char)buffer[len] < 0xC0);
+                printf("\b \b");
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        if (c >= 32) {                      /* printable byte (includes UTF-8 bytes) */
+            if (len + 1 < buffer_size) {
+                buffer[len++] = (char)c;
+                putchar((char)c);
+                fflush(stdout);
+            }
+        }
+        /* other control characters are ignored */
+    }
 }
 
 static int read_line(const char *prompt, char *out, size_t out_size) {
@@ -655,12 +775,17 @@ static int read_required_line(const char *prompt, char *out, size_t out_size) {
     }
 }
 
+/* read_int_range returns the chosen number, or INPUT_CANCEL when the user
+   pressed ESC (g_input_canceled is set) or the input ended. Callers treat
+   INPUT_CANCEL as "go back / cancel this action". */
+#define INPUT_CANCEL INT_MIN
+
 static int read_int_range(const char *prompt, int min_value, int max_value) {
     char line[64];
     int value;
 
     for (;;) {
-        if (!read_line(prompt, line, sizeof(line))) return min_value;
+        if (!read_line(prompt, line, sizeof(line))) return INPUT_CANCEL;
         if (parse_int_strict(line, min_value, max_value, &value)) return value;
 
         print_indent(get_layout().left);
@@ -1002,6 +1127,28 @@ static int load_database(Database *db) {
                           sizeof(db->items[slot].values[fi]),
                           cells[4]);
             }
+        } else if (strings_equal_ci(cells[0], "CREATED")) {
+            int slot;
+            int id;
+
+            if (is_blank(cells[1]) || is_blank(cells[2])) continue;
+            if (!parse_int_strict(cells[2], 1, INT_MAX, &id)) continue;
+
+            /* Create the item slot if it does not exist yet, so the timestamp
+               loads correctly no matter where the CREATED row sits in the file. */
+            if (ensure_category(db, cells[1]) < 0) continue;
+            slot = find_item_slot_by_id(db, cells[1], id);
+            if (slot < 0) {
+                slot = allocate_item(db, cells[1], id);
+                if (slot < 0) {
+                    g_load_truncated = 1;
+                }
+            }
+            if (slot >= 0) {
+                safe_copy(db->items[slot].created,
+                          sizeof(db->items[slot].created),
+                          cells[3]);
+            }
         }
     }
 
@@ -1059,6 +1206,18 @@ static int save_database(Database *db) {
         if (ci < 0) continue;
 
         snprintf(idbuf, sizeof(idbuf), "%d", db->items[i].id);
+
+        /* Persist the creation timestamp on its own row. Old files simply have
+           no CREATED rows, so this stays fully backward compatible. */
+        if (db->items[i].created[0] != '\0') {
+            csv_write_row5(fp,
+                           "CREATED",
+                           db->items[i].category,
+                           idbuf,
+                           db->items[i].created,
+                           "");
+        }
+
         for (f = 0; f < db->categories[ci].field_count; f++) {
             csv_write_row5(fp,
                            "ITEM",
@@ -1098,7 +1257,7 @@ static int save_database(Database *db) {
 static void build_item_preview(const Database *db, int slot, char *out, size_t out_size) {
     int ci;
     int f;
-    int written = 0;
+    int shown = 0;          /* how many fields we have added to the preview */
 
     if (out == NULL || out_size == 0) return;
     out[0] = '\0';
@@ -1111,21 +1270,28 @@ static void build_item_preview(const Database *db, int slot, char *out, size_t o
     for (f = 0; f < db->categories[ci].field_count; f++) {
         if (db->items[slot].values[f][0] != '\0') {
             char piece[256];
-            snprintf(piece,
-                     sizeof(piece),
-                     "%s%s: %.80s",
-                     written ? " | " : "",
-                     db->categories[ci].fields[f].name,
-                     db->items[slot].values[f]);
-            if (strlen(out) + strlen(piece) + 1 < out_size) {
-                strcat(out, piece);
-                written = 1;
+            size_t used = strlen(out);
+            int n;
+
+            n = snprintf(piece,
+                         sizeof(piece),
+                         "%s%s: %.80s",
+                         shown > 0 ? " | " : "",
+                         db->categories[ci].fields[f].name,
+                         db->items[slot].values[f]);
+            if (n < 0) continue;
+
+            /* Append only if it fits, leaving room for the terminating NUL. */
+            if (used + (size_t)n + 1 < out_size) {
+                memcpy(out + used, piece, (size_t)n + 1);
+                shown++;
             }
-            if (written >= 2) break;
+
+            if (shown >= 2) break;   /* a two-field preview is enough */
         }
     }
 
-    if (!written) safe_copy(out, out_size, "empty item");
+    if (shown == 0) safe_copy(out, out_size, "empty item");
 }
 
 static void ui_table_header(const char *a, const char *b, const char *c, int aw, int bw, int cw) {
@@ -1225,6 +1391,9 @@ static void view_item(Database *db, int slot) {
     if (ci < 0) {
         ui_line(lay, "Category not found.", COLOR_RED);
     } else {
+        if (db->items[slot].created[0] != '\0') {
+            ui_key_value("Created", db->items[slot].created);
+        }
         for (f = 0; f < db->categories[ci].field_count; f++) {
             ui_key_value(db->categories[ci].fields[f].name, db->items[slot].values[f]);
         }
@@ -1274,7 +1443,7 @@ static void list_items_in_category(Database *db, int ci) {
     }
 
     choice = read_int_range("Item ID to view, or 0:", 0, INT_MAX);
-    if (choice != 0) {
+    if (choice != 0 && choice != INPUT_CANCEL) {
         int slot;
         slot = find_item_slot_by_id(db, cat->name, choice);
         if (slot >= 0) {
@@ -1327,6 +1496,9 @@ static void add_item(Database *db, int ci) {
         return;
     }
 
+    /* Stamp the creation time in ISO 8601 (e.g. 2026-05-29T20:17:08). */
+    iso8601_now(db->items[slot].created, sizeof(db->items[slot].created));
+
     label_width = category_input_label_width(cat);
 
     for (f = 0; f < cat->field_count; f++) {
@@ -1367,6 +1539,7 @@ static void edit_item(Database *db, int ci) {
 
     ui_header("Edit item", cat->name);
     id = read_int_range("Item ID:", 1, INT_MAX);
+    if (id == INPUT_CANCEL) return;
 
     slot = find_item_slot_by_id(db, cat->name, id);
     if (slot < 0) {
@@ -1421,6 +1594,7 @@ static void delete_item(Database *db, int ci) {
 
     ui_header("Delete item", cat->name);
     id = read_int_range("Item ID:", 1, INT_MAX);
+    if (id == INPUT_CANCEL) return;
 
     slot = find_item_slot_by_id(db, cat->name, id);
     if (slot < 0) {
@@ -1542,6 +1716,7 @@ static void add_category_ui(Database *db) {
     }
 
     n = read_int_range("Custom fields:", 1, MAX_FIELDS);
+    if (n == INPUT_CANCEL) n = 0;
 
     for (i = 0; i < n; i++) {
         char field[MAX_NAME];
@@ -1742,7 +1917,7 @@ static void manage_fields(Database *db, int ci) {
         ui_menu_box("Field Actions", "Schema editor", items, nums, 4);
 
         choice = read_int_range("Choice:", 0, 3);
-        if (choice == 0) return;
+        if (choice == 0 || choice == INPUT_CANCEL) return;
 
         if (choice == 1) {
             char field[MAX_NAME];
@@ -1777,7 +1952,9 @@ static void manage_fields(Database *db, int ci) {
                 continue;
             }
 
-            fi = read_int_range("Field number:", 1, cat->field_count) - 1;
+            fi = read_int_range("Field number:", 1, cat->field_count);
+            if (fi == INPUT_CANCEL) continue;
+            fi = fi - 1;
             if (read_required_line("New field:", field, sizeof(field))) {
                 if (strings_equal_ci(field, cat->fields[fi].name)) {
                     print_indent(get_layout().left);
@@ -1806,7 +1983,9 @@ static void manage_fields(Database *db, int ci) {
                 continue;
             }
 
-            fi = read_int_range("Field number:", 1, cat->field_count) - 1;
+            fi = read_int_range("Field number:", 1, cat->field_count);
+            if (fi == INPUT_CANCEL) continue;
+            fi = fi - 1;
             snprintf(question,
                      sizeof(question),
                      "Delete field '%s' and all its values?",
@@ -1876,10 +2055,10 @@ static void category_menu(Database *db, int ci) {
                  db->categories[ci].field_count);
 
         ui_header(db->categories[ci].name, subtitle);
-        ui_menu_box("Category Menu", "Choose an action", items, nums, 9);
+        ui_menu_box("Category Menu", "Choose an action  -  ESC = back", items, nums, 9);
 
         choice = read_int_range("Choice:", 0, 8);
-        if (choice == 0) return;
+        if (choice == 0 || choice == INPUT_CANCEL) return;
         if (choice == 1) list_items_in_category(db, ci);
         else if (choice == 2) add_item(db, ci);
         else if (choice == 3) search_items(db, ci);
@@ -1908,7 +2087,7 @@ static void open_category(Database *db) {
     }
 
     choice = read_int_range("Open number, or 0:", 0, db->category_count);
-    if (choice > 0) category_menu(db, choice - 1);
+    if (choice != INPUT_CANCEL && choice > 0) category_menu(db, choice - 1);
 }
 
 static void show_stats(Database *db) {
@@ -2022,11 +2201,16 @@ static void export_text_report(Database *db) {
         return;
     }
 
-    fprintf(fp, "%s - Text Report\n", APP_NAME);
-    fprintf(fp, "%s\n", APP_TAGLINE);
-    fprintf(fp, "============================================================\n");
-    fprintf(fp, "Categories: %d    Items: %d\n", db->category_count, db->item_count);
-    fprintf(fp, "============================================================\n\n");
+    {
+        char stamp[32];
+        iso8601_now(stamp, sizeof(stamp));
+        fprintf(fp, "%s - Text Report\n", APP_NAME);
+        fprintf(fp, "%s\n", APP_TAGLINE);
+        fprintf(fp, "Generated: %s\n", stamp[0] != '\0' ? stamp : "unknown");
+        fprintf(fp, "============================================================\n");
+        fprintf(fp, "Categories: %d    Items: %d\n", db->category_count, db->item_count);
+        fprintf(fp, "============================================================\n\n");
+    }
 
     for (c = 0; c < db->category_count; c++) {
         const Category *cat = &db->categories[c];
@@ -2042,6 +2226,9 @@ static void export_text_report(Database *db) {
 
             shown++;
             fprintf(fp, "Item #%d\n", it->id);
+            if (it->created[0] != '\0') {
+                fprintf(fp, "  Created: %s\n", it->created);
+            }
             for (f = 0; f < cat->field_count; f++) {
                 fprintf(fp, "  %s: %s\n", cat->fields[f].name, it->values[f]);
             }
@@ -2114,9 +2301,21 @@ static void main_menu(Database *db) {
         ui_header(APP_TAGLINE, subtitle);
         ui_status_box("Vault Status", left, right);
         putchar('\n');
-        ui_menu_box("Main Menu", "Elegant catalog management", items, nums, 7);
+        ui_menu_box("Main Menu", "Elegant catalog management  -  ESC = back", items, nums, 7);
 
         choice = read_int_range("Choice:", 0, 6);
+
+        if (choice == INPUT_CANCEL) {
+            /* At the top menu there is nowhere to go back to. A lone ESC just
+               redraws the menu; an ended input (Ctrl+D) exits safely. */
+            if (g_input_canceled) {
+                g_input_canceled = 0;
+                continue;
+            }
+            if (db->dirty) (void)save_database(db);
+            ui_header("Goodbye", "Your life catalog is safe.");
+            return;
+        }
 
         if (choice == 0) {
             if (db->dirty) (void)save_database(db);
