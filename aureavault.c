@@ -114,6 +114,7 @@ typedef struct {
 
 static Database g_db;
 static int g_color = 1;   /* 1 = colors on, 0 = plain text (no escapes) */
+static int g_load_truncated = 0; /* set if the file held more data than fits in memory */
 
 static void clear_screen(void);
 static int terminal_is_ansi(void);
@@ -122,6 +123,7 @@ static int load_database(Database *db);
 static int save_database(Database *db);
 static void main_menu(Database *db);
 static int read_line_raw(char *buffer, size_t buffer_size);
+static void export_text_report(Database *db);
 
 static int safe_copy(char *dst, size_t dst_size, const char *src) {
     size_t n;
@@ -986,7 +988,15 @@ static int load_database(Database *db) {
             if (fi < 0) continue;
 
             slot = find_item_slot_by_id(db, cells[1], id);
-            if (slot < 0) slot = allocate_item(db, cells[1], id);
+            if (slot < 0) {
+                slot = allocate_item(db, cells[1], id);
+                if (slot < 0) {
+                    /* The file holds more items than fit in memory. Remember this
+                       so we can warn the user and refuse to overwrite the file,
+                       which protects the items we could not load. */
+                    g_load_truncated = 1;
+                }
+            }
             if (slot >= 0) {
                 safe_copy(db->items[slot].values[fi],
                           sizeof(db->items[slot].values[fi]),
@@ -1008,6 +1018,13 @@ static int save_database(Database *db) {
     char idbuf[32];
 
     if (db == NULL) return 0;
+
+    if (g_load_truncated) {
+        /* Safety guard: the file on disk has more data than this build can hold,
+           so writing now would erase the items we did not load. Refuse to save
+           and keep the original file untouched. */
+        return 0;
+    }
 
     fp = fopen(DB_TEMP_FILE, "w");
     if (fp == NULL) {
@@ -1982,6 +1999,89 @@ static void create_demo_if_empty(Database *db) {
     }
 }
 
+static void export_text_report(Database *db) {
+    static const char *REPORT_FILE = "aureavault_report.txt";
+    static const char *REPORT_TEMP = "aureavault_report.txt.tmp";
+    FILE *fp;
+    int c;
+    int f;
+    int i;
+
+    if (db == NULL) return;
+
+    ui_header("Text Report", "Export a printer-friendly summary of your vault.");
+
+    /* Write to a temporary file first, then rename. If anything fails, the
+       previous report (if any) stays untouched. This is the same safe pattern
+       the database uses. */
+    fp = fopen(REPORT_TEMP, "w");
+    if (fp == NULL) {
+        print_indent(get_layout().left);
+        printf("%s" "Could not create the report file.\n" "%s", COLOR_RED, COLOR_RESET);
+        pause_enter();
+        return;
+    }
+
+    fprintf(fp, "%s - Text Report\n", APP_NAME);
+    fprintf(fp, "%s\n", APP_TAGLINE);
+    fprintf(fp, "============================================================\n");
+    fprintf(fp, "Categories: %d    Items: %d\n", db->category_count, db->item_count);
+    fprintf(fp, "============================================================\n\n");
+
+    for (c = 0; c < db->category_count; c++) {
+        const Category *cat = &db->categories[c];
+        int shown = 0;
+
+        fprintf(fp, "## %s\n", cat->name);
+        fprintf(fp, "------------------------------------------------------------\n");
+
+        for (i = 0; i < MAX_ITEMS; i++) {
+            const Item *it = &db->items[i];
+            if (!it->used) continue;
+            if (!strings_equal_ci(it->category, cat->name)) continue;
+
+            shown++;
+            fprintf(fp, "Item #%d\n", it->id);
+            for (f = 0; f < cat->field_count; f++) {
+                fprintf(fp, "  %s: %s\n", cat->fields[f].name, it->values[f]);
+            }
+            fprintf(fp, "\n");
+        }
+
+        if (shown == 0) {
+            fprintf(fp, "(no items)\n\n");
+        }
+    }
+
+    /* Make sure every byte reaches the disk before we replace the old file. */
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        print_indent(get_layout().left);
+        printf("%s" "Could not finish writing the report.\n" "%s", COLOR_RED, COLOR_RESET);
+        pause_enter();
+        return;
+    }
+    if (fclose(fp) != 0) {
+        print_indent(get_layout().left);
+        printf("%s" "Could not close the report file.\n" "%s", COLOR_RED, COLOR_RESET);
+        pause_enter();
+        return;
+    }
+    if (rename(REPORT_TEMP, REPORT_FILE) != 0) {
+        print_indent(get_layout().left);
+        printf("%s" "Could not save the report file.\n" "%s", COLOR_RED, COLOR_RESET);
+        pause_enter();
+        return;
+    }
+
+    putchar('\n');
+    print_indent(get_layout().left);
+    printf("%s" "Report saved to %s" "%s\n", COLOR_GREEN, REPORT_FILE, COLOR_RESET);
+    print_indent(get_layout().left);
+    printf("You can open or print it with any text editor.\n");
+    pause_enter();
+}
+
 static void main_menu(Database *db) {
     int choice;
 
@@ -1997,9 +2097,10 @@ static void main_menu(Database *db) {
             {"Search all", "Search in every category and field"},
             {"Statistics", "See totals and database overview"},
             {"Help", "Quick explanation"},
+            {"Generate Text Report", "Export a printer-friendly .txt file"},
             {"Save and exit", "Close AureaVault safely"}
         };
-        const int nums[] = {1, 2, 3, 4, 5, 0};
+        const int nums[] = {1, 2, 3, 4, 5, 6, 0};
 
         snprintf(subtitle,
                  sizeof(subtitle),
@@ -2013,9 +2114,9 @@ static void main_menu(Database *db) {
         ui_header(APP_TAGLINE, subtitle);
         ui_status_box("Vault Status", left, right);
         putchar('\n');
-        ui_menu_box("Main Menu", "Elegant catalog management", items, nums, 6);
+        ui_menu_box("Main Menu", "Elegant catalog management", items, nums, 7);
 
-        choice = read_int_range("Choice:", 0, 5);
+        choice = read_int_range("Choice:", 0, 6);
 
         if (choice == 0) {
             if (db->dirty) (void)save_database(db);
@@ -2027,6 +2128,7 @@ static void main_menu(Database *db) {
         else if (choice == 3) search_items(db, -1);
         else if (choice == 4) show_stats(db);
         else if (choice == 5) show_help();
+        else if (choice == 6) export_text_report(db);
     }
 }
 
@@ -2083,7 +2185,12 @@ int main(void) {
     choose_color_mode();
 
     loaded = load_database(&g_db);
-    ui_header(APP_TAGLINE, loaded ? "Database loaded." : "New database.");
+    if (g_load_truncated) {
+        ui_header(APP_TAGLINE,
+                  "WARNING: file too large - opened READ-ONLY, saving is blocked.");
+    } else {
+        ui_header(APP_TAGLINE, loaded ? "Database loaded." : "New database.");
+    }
 
     if (!loaded) create_demo_if_empty(&g_db);
     main_menu(&g_db);
